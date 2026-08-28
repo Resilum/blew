@@ -7,6 +7,12 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Added
 
+- The JNI parity test now compares **signatures**, not just names. It reports
+  arity and per-parameter type drift between each Kotlin `external fun` and
+  its Rust `extern "C"` hook — a mismatch the JVM otherwise only surfaces as a
+  crash at call time, on a device. Verified by mutation: both a changed
+  parameter type and a dropped parameter fail the test.
+
 - **`L2capConfig`**, on `CentralConfig::l2cap` and `PeripheralConfig::l2cap`:
   `buffer_size`, `read_chunk_size` and `linger_timeout`. Linux observes none of
   them — `bluer::l2cap::Stream` is already an async byte stream handed straight
