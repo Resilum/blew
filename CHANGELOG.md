@@ -124,6 +124,16 @@ All notable changes to `blew` are documented here. Format follows
   transmitting. The unbounded queues were converting the protocol's own flow
   control into local memory growth.
 
+- **Apple: the L2CAP reactor is event-driven rather than a 20 Hz poll.** It
+  woke every 50 ms and re-checked every channel, whether or not anything had
+  happened, which cost idle CPU proportional to open channels and added up to
+  50 ms of latency. Each channel's streams now carry an `NSStreamDelegate`, and
+  the reactor is pulled out of its wait by `CFRunLoopWakeUp` when an
+  application write queues bytes — an app `write()` produces no stream event,
+  so it needs the explicit nudge. Only channels that signalled are serviced.
+  The remaining timeout is a 1s backstop against a missed wakeup, not the
+  service interval.
+
 - **Apple: a busy L2CAP channel is no longer torn down instead of throttled.**
   The reactor called `write:maxLength:` without first checking
   `hasSpaceAvailable`, and treated the resulting non-positive return as a dead

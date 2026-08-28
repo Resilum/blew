@@ -66,6 +66,7 @@ objc2-foundation = { version = "0.3", features = [
 ] }
 objc2-core-bluetooth = { version = "0.3", features = ["CBError", "CBCentralManagerConstants"] }
 dispatch2 = { version = "0.3", features = ["alloc", "objc2"] }
+objc2-core-foundation = { version = "0.3", features = ["CFRunLoop"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer = { version = "0.17", features = ["full"] }

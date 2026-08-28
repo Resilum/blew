@@ -22,17 +22,22 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-use objc2::rc::autoreleasepool;
+use objc2::rc::{Retained, autoreleasepool};
+use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::{AnyThread, DefinedClass, define_class};
 use objc2_core_bluetooth::CBL2CAPChannel;
+use objc2_core_foundation::{CFRetained, CFRunLoop};
 use objc2_foundation::{
-    NSDate, NSDefaultRunLoopMode, NSInputStream, NSOutputStream, NSRunLoop, NSStreamStatus,
+    NSDate, NSDefaultRunLoopMode, NSInputStream, NSOutputStream, NSRunLoop, NSStream,
+    NSStreamDelegate, NSStreamEvent, NSStreamStatus,
 };
+use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -42,7 +47,10 @@ use crate::l2cap::types::{L2capCloseReason, L2capConfig};
 use crate::l2cap::{CloseReasonSlot, DuplexBridge, L2capChannel};
 use crate::platform::apple::helpers::{ObjcSend, retain_send};
 
-const RUN_LOOP_POLL_SECS: f64 = 0.05;
+/// Backstop only. The reactor is woken by stream events and by
+/// [`wake_reactor`], so this bounds how long a *missed* wakeup could stall a
+/// channel rather than setting the service interval.
+const RUN_LOOP_IDLE_SECS: f64 = 1.0;
 /// Smallest number of queued chunks per direction, so a tiny `buffer_size` can
 /// never produce a zero-capacity channel (which would deadlock).
 const MIN_QUEUE_CHUNKS: usize = 2;
@@ -52,6 +60,88 @@ type OutputStream = Arc<ObjcSend<NSOutputStream>>;
 
 static REACTOR_TX: OnceLock<mpsc::Sender<ReactorCmd>> = OnceLock::new();
 static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
+static REACTOR_RUN_LOOP: OnceLock<SendRunLoop> = OnceLock::new();
+static REACTOR_READY: OnceLock<ReadySet> = OnceLock::new();
+
+/// The reactor thread's run loop, so other threads can pull it out of its wait.
+///
+/// # Safety
+/// `CFRunLoopWakeUp` is one of the few run-loop calls Apple documents as safe
+/// to make from any thread; nothing else is done with this handle.
+struct SendRunLoop(CFRetained<CFRunLoop>);
+unsafe impl Send for SendRunLoop {}
+unsafe impl Sync for SendRunLoop {}
+
+/// Pull the reactor out of `acceptInputForMode:beforeDate:`.
+///
+/// Needed because the two things that give a channel work are not both visible
+/// to the run loop: peer traffic arrives as a stream event, but an application
+/// `write()` only lands in a Tokio channel the reactor polls. Without this, an
+/// outbound write would wait for the idle backstop.
+fn wake_reactor() {
+    if let Some(run_loop) = REACTOR_RUN_LOOP.get() {
+        // Safe against the obvious race: a wake delivered while the reactor is
+        // between passes latches on the run loop's wakeup port, so the next
+        // wait returns immediately rather than sleeping through the work.
+        run_loop.0.wake_up();
+    }
+}
+
+/// Channels with news since the reactor last looked.
+///
+/// Written by the stream delegate (on the reactor thread) and by the outbound
+/// bridge tasks (on Tokio workers); drained by the reactor each pass.
+#[derive(Clone, Default)]
+struct ReadySet(Arc<Mutex<HashSet<u64>>>);
+
+impl ReadySet {
+    fn mark(&self, id: u64) {
+        self.0.lock().insert(id);
+    }
+
+    fn drain(&self) -> HashSet<u64> {
+        std::mem::take(&mut *self.0.lock())
+    }
+}
+
+struct StreamDelegateIvars {
+    id: u64,
+    ready: ReadySet,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "BlewL2capStreamDelegate"]
+    #[ivars = StreamDelegateIvars]
+    struct StreamDelegate;
+
+    unsafe impl NSObjectProtocol for StreamDelegate {}
+
+    unsafe impl NSStreamDelegate for StreamDelegate {
+        /// Fires on the reactor thread, since that is where the streams are
+        /// scheduled.
+        ///
+        /// The event code is deliberately ignored: `pump_output` and
+        /// `pump_input` already distinguish data, space, EOF and error from the
+        /// stream itself, and acting on the code here would duplicate that in a
+        /// second place that could drift. What matters is that a delegate
+        /// exists at all -- it makes "the run loop processed this stream's
+        /// source" a defined event rather than something we hope happens.
+        #[unsafe(method(stream:handleEvent:))]
+        #[allow(non_snake_case, reason = "mirrors the Objective-C selector")]
+        unsafe fn stream_handleEvent(&self, _stream: &NSStream, _event: NSStreamEvent) {
+            let ivars = self.ivars();
+            ivars.ready.mark(ivars.id);
+        }
+    }
+);
+
+impl StreamDelegate {
+    fn new(id: u64, ready: ReadySet) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(StreamDelegateIvars { id, ready });
+        unsafe { objc2::msg_send![super(this), init] }
+    }
+}
 
 /// Queue depth in chunks for `buffer_size` bytes of `read_chunk_size` chunks.
 fn queue_capacity(config: &L2capConfig) -> usize {
@@ -97,6 +187,19 @@ struct ReactorChannel {
     linger_timeout: Option<Duration>,
     read_chunk_size: usize,
     close_reason: CloseReasonSlot,
+    /// `setDelegate:` does not retain, so the delegate has to live here or the
+    /// streams would be left pointing at freed memory.
+    _delegate: Retained<StreamDelegate>,
+}
+
+/// Whether a channel should be serviced this pass.
+///
+/// A lingering channel is always serviced: its deadline has to be checked even
+/// when idle, and once the peer goes quiet nothing else will signal it -- so
+/// skipping it would leave the channel open until the idle backstop, or
+/// forever if the deadline is `None`.
+fn needs_service(ready: &HashSet<u64>, id: u64, closing: bool) -> bool {
+    closing || ready.contains(&id)
 }
 
 /// Whether a closing channel is finished: everything queued has been written,
@@ -125,18 +228,34 @@ fn linger_finished(
 struct L2capReactor {
     cmd_rx: mpsc::Receiver<ReactorCmd>,
     channels: HashMap<u64, ReactorChannel>,
+    ready: ReadySet,
 }
 
 fn default_run_loop_mode() -> &'static objc2_foundation::NSRunLoopMode {
     unsafe { NSDefaultRunLoopMode }
 }
 
+/// Send a command and wake the reactor so it acts on it promptly.
+fn send_cmd(cmd: ReactorCmd) -> Result<(), mpsc::SendError<ReactorCmd>> {
+    reactor_tx().send(cmd)?;
+    wake_reactor();
+    Ok(())
+}
+
+/// The reactor's ready set. Created here rather than inside the reactor so it
+/// is available to bridge tasks the moment a channel exists, without racing
+/// the reactor thread's startup.
+fn ready_set() -> &'static ReadySet {
+    REACTOR_READY.get_or_init(ReadySet::default)
+}
+
 fn reactor_tx() -> &'static mpsc::Sender<ReactorCmd> {
     REACTOR_TX.get_or_init(|| {
         let (tx, rx) = mpsc::channel();
+        let ready = ready_set().clone();
         std::thread::Builder::new()
             .name("blew-l2cap-reactor".to_string())
-            .spawn(move || L2capReactor::new(rx).run())
+            .spawn(move || L2capReactor::new(rx, ready).run())
             .expect("spawn blew-l2cap-reactor");
         tx
     })
@@ -177,8 +296,9 @@ impl ReactorChannel {
             };
             // Asking an NSOutputStream to write with no space either blocks the
             // reactor thread -- stalling every other channel -- or reports a
-            // failure we would misread as a dead channel. Wait for the next tick
-            // instead; the peer's credits will free space.
+            // failure we would misread as a dead channel. Stop instead: the
+            // peer returning credits produces a HasSpaceAvailable event, which
+            // re-marks this channel and brings us back here.
             if !self.output.hasSpaceAvailable() {
                 break;
             }
@@ -262,6 +382,10 @@ fn close_channel(
     trace!(id, ?reason, "apple L2CAP reactor closing channel");
     channel.close_reason.set(reason.clone());
     unsafe {
+        // Unset before unscheduling: `setDelegate:` does not retain, so a
+        // stream outliving the delegate would hold a dangling pointer.
+        channel.input.setDelegate(None);
+        channel.output.setDelegate(None);
         channel
             .input
             .removeFromRunLoop_forMode(run_loop, default_run_loop_mode());
@@ -275,10 +399,11 @@ fn close_channel(
 }
 
 impl L2capReactor {
-    fn new(cmd_rx: mpsc::Receiver<ReactorCmd>) -> Self {
+    fn new(cmd_rx: mpsc::Receiver<ReactorCmd>, ready: ReadySet) -> Self {
         Self {
             cmd_rx,
             channels: HashMap::new(),
+            ready,
         }
     }
 
@@ -286,11 +411,18 @@ impl L2capReactor {
         autoreleasepool(|_| {
             trace!("apple L2CAP reactor started");
             let run_loop = NSRunLoop::currentRunLoop();
+            // Publish before servicing anything, so a wake that races startup
+            // is not lost.
+            if let Some(cf) = CFRunLoop::current() {
+                let _ = REACTOR_RUN_LOOP.set(SendRunLoop(cf));
+            } else {
+                warn!("apple L2CAP reactor has no CFRunLoop; falling back to idle polling");
+            }
             loop {
                 autoreleasepool(|_| {
                     self.drain_commands(&run_loop);
                     self.pump_channels(&run_loop);
-                    Self::poll_run_loop(&run_loop);
+                    Self::wait_for_work(&run_loop);
                 });
             }
         });
@@ -307,6 +439,7 @@ impl L2capReactor {
                         && channel.closing_since.is_none()
                     {
                         channel.closing_since = Some(Instant::now());
+                        self.ready.mark(id);
                         trace!(id, "apple L2CAP channel closing; draining outbound queue");
                     }
                 }
@@ -328,12 +461,19 @@ impl L2capReactor {
         } = channel;
 
         trace!(id, "apple L2CAP reactor registering channel");
+        let delegate = StreamDelegate::new(id, self.ready.clone());
+        let delegate_ref = ProtocolObject::from_ref(&*delegate);
         unsafe {
+            input.setDelegate(Some(delegate_ref));
+            output.setDelegate(Some(delegate_ref));
             input.scheduleInRunLoop_forMode(run_loop, default_run_loop_mode());
             output.scheduleInRunLoop_forMode(run_loop, default_run_loop_mode());
         }
         input.open();
         output.open();
+        // Service it once without waiting for an event; opening may already
+        // have made space available.
+        self.ready.mark(id);
         self.channels.insert(
             id,
             ReactorChannel {
@@ -349,14 +489,19 @@ impl L2capReactor {
                 linger_timeout,
                 read_chunk_size,
                 close_reason,
+                _delegate: delegate,
             },
         );
     }
 
     fn pump_channels(&mut self, run_loop: &NSRunLoop) {
         let now = Instant::now();
+        let ready = self.ready.drain();
         let mut finished = Vec::new();
         for (&id, channel) in &mut self.channels {
+            if !needs_service(&ready, id, channel.closing_since.is_some()) {
+                continue;
+            }
             if let Pump::Done(reason) = channel.pump_output() {
                 finished.push((id, reason));
                 continue;
@@ -391,8 +536,10 @@ impl L2capReactor {
         }
     }
 
-    fn poll_run_loop(run_loop: &NSRunLoop) {
-        let deadline = NSDate::dateWithTimeIntervalSinceNow(RUN_LOOP_POLL_SECS);
+    /// Block until a stream event, a [`wake_reactor`] call, or the idle
+    /// backstop.
+    fn wait_for_work(run_loop: &NSRunLoop) {
+        let deadline = NSDate::dateWithTimeIntervalSinceNow(RUN_LOOP_IDLE_SECS);
         run_loop.acceptInputForMode_beforeDate(default_run_loop_mode(), &deadline);
     }
 }
@@ -435,26 +582,26 @@ pub(crate) fn bridge_l2cap_channel(
     let (outbound_tx, outbound_rx) = tokio_mpsc::channel::<Vec<u8>>(capacity);
     let close_reason = CloseReasonSlot::default();
 
-    let reactor = reactor_tx().clone();
+    let outbound_ready = ready_set().clone();
     let channel_id = next_channel_id();
 
-    reactor
-        .send(ReactorCmd::Register(Box::new(RegisterChannel {
-            id: channel_id,
-            channel_ref: Arc::clone(&channel),
-            input,
-            output,
-            inbound_tx,
-            outbound_rx,
-            read_chunk_size: config.read_chunk_size.max(1),
-            close_reason: close_reason.clone(),
-            linger_timeout: config.linger_timeout,
-        })))
-        .expect("apple L2CAP reactor available");
+    send_cmd(ReactorCmd::Register(Box::new(RegisterChannel {
+        id: channel_id,
+        channel_ref: Arc::clone(&channel),
+        input,
+        output,
+        inbound_tx,
+        outbound_rx,
+        read_chunk_size: config.read_chunk_size.max(1),
+        close_reason: close_reason.clone(),
+        linger_timeout: config.linger_timeout,
+    })))
+    .expect("apple L2CAP reactor available");
 
     let (app_side, io_side) = tokio::io::duplex(config.buffer_size);
     let (mut io_reader, mut io_writer) = tokio::io::split(io_side);
 
+    let inbound_ready = ready_set().clone();
     runtime.spawn(async move {
         trace!(id = channel_id, "apple L2CAP inbound async bridge started");
         while let Some(bytes) = inbound_rx.recv().await {
@@ -465,6 +612,13 @@ pub(crate) fn bridge_l2cap_channel(
                 );
                 break;
             }
+            // Draining one chunk frees inbound capacity, which is the only
+            // thing that lets a paused `pump_input` resume. No stream event
+            // will say so: `hasBytesAvailable` is a level, not an edge, so the
+            // unread bytes that stalled us generate no new notification.
+            // Without this the channel would stall until the idle backstop.
+            inbound_ready.mark(channel_id);
+            wake_reactor();
         }
         trace!(id = channel_id, "apple L2CAP inbound async bridge exited");
     });
@@ -500,17 +654,23 @@ pub(crate) fn bridge_l2cap_channel(
                 );
                 break;
             }
+            // An application write produces no stream event, so the reactor has
+            // no other way to learn this channel has bytes waiting.
+            outbound_ready.mark(channel_id);
+            wake_reactor();
         }
-        // Dropping `outbound_tx` is the reactor's signal that no more bytes are
-        // coming, which lets it complete the flush handshake for `close()`.
+        // Dropping `outbound_tx` is how the reactor learns no more bytes are
+        // coming, which lets a lingering close finish.
         drop(outbound_tx);
+        outbound_ready.mark(channel_id);
+        wake_reactor();
         trace!(id = channel_id, "apple L2CAP outbound async bridge exited");
     });
 
     Ok(L2capChannel::from_bridge(DuplexBridge {
         inner: app_side,
         close_hook: Some(Box::new(move || {
-            let _ = reactor.send(ReactorCmd::Close { id: channel_id });
+            let _ = send_cmd(ReactorCmd::Close { id: channel_id });
         })),
         close_reason,
     }))
@@ -538,6 +698,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(queue_capacity(&config), 2);
+    }
+
+    #[test]
+    fn ready_set_drains_once() {
+        let ready = ReadySet::default();
+        ready.mark(1);
+        ready.mark(2);
+        ready.mark(1);
+        assert_eq!(ready.drain(), HashSet::from([1, 2]));
+        assert!(
+            ready.drain().is_empty(),
+            "a drained mark must not be replayed"
+        );
+    }
+
+    #[test]
+    fn only_signalled_channels_are_serviced() {
+        let ready = HashSet::from([7_u64]);
+        assert!(needs_service(&ready, 7, false));
+        assert!(!needs_service(&ready, 8, false));
+    }
+
+    #[test]
+    fn a_closing_channel_is_serviced_even_unsignalled() {
+        // Otherwise its linger deadline is never evaluated and it stays open.
+        let ready = HashSet::new();
+        assert!(needs_service(&ready, 7, true));
     }
 
     #[test]
