@@ -257,15 +257,27 @@ impl CentralBackend for LinuxCentral {
             debug!(service_filter = ?filter.services, "starting BLE scan");
             // BlueZ replays its device cache as DeviceAdded events at the start of
             // every discovery session, using stale names/UUIDs from previous sessions.
-            // Remove non-connected cached devices so BlueZ treats them as new and
-            // emits fresh advertisement data.
+            // Dropping cached devices makes BlueZ treat them as new and emit fresh
+            // advertisement data.
+            //
+            // `remove_device` deletes the BlueZ record outright, taking its bonding
+            // keys and trust flag with it — and the cache is shared with every other
+            // application on the host. Never evict a device that is connected,
+            // paired, or trusted: those belong to the user, not to this scan. Any
+            // property we cannot read is treated as a reason to keep the device.
             if let Ok(addrs) = handle.adapter.device_addresses().await {
                 for addr in addrs {
-                    if let Ok(dev) = handle.adapter.device(addr)
-                        && !dev.is_connected().await.unwrap_or(false)
-                    {
-                        handle.adapter.remove_device(addr).await.ok();
+                    let Ok(dev) = handle.adapter.device(addr) else {
+                        continue;
+                    };
+                    let keep = dev.is_connected().await.unwrap_or(true)
+                        || dev.is_paired().await.unwrap_or(true)
+                        || dev.is_trusted().await.unwrap_or(true);
+                    if keep {
+                        trace!(device_id = %addr, "keeping cached device out of scan-start eviction");
+                        continue;
                     }
+                    handle.adapter.remove_device(addr).await.ok();
                 }
             }
 

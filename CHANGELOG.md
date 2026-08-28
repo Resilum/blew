@@ -19,6 +19,18 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Fixed
 
+- **Linux: starting a scan no longer deletes the user's bonded devices.**
+  `start_scan` cleared BlueZ's stale device cache by calling
+  `Adapter::remove_device` on every cached address that was not currently
+  connected. That cache is shared host-wide and `remove_device` deletes the
+  record outright — so a scan could drop the pairing keys and trust flag of
+  the user's keyboard, headphones, or any other bonded peripheral that
+  happened to be idle. Devices that are connected, paired, or trusted are
+  now left alone, as is any device whose properties cannot be read. Stale
+  advertisement data may therefore persist for bonded peers; unbonded peers,
+  which is what peer-to-peer discovery actually cares about, still get a
+  fresh cache.
+
 - **Apple: notifications are no longer silently dropped under load.**
   `notify_characteristic` discarded the `BOOL` returned by
   `updateValue:forCharacteristic:onSubscribedCentrals:` and reported
