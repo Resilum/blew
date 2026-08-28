@@ -5,7 +5,31 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `Default` for `GattService`, `GattCharacteristic`, `GattDescriptor`,
+  `CharacteristicProperties` and `AttributePermissions`, plus
+  `AdvertisingConfig`, so all of them can be built with the
+  `..Default::default()` spread that `CentralConfig` already documented.
+  `GattService::default()` sets `primary: true` rather than the `false` a
+  derive would give — secondary services exist only to be included by
+  another service and are vanishingly rare.
+
 ### Changed
+
+- **Breaking: `BleDevice` is now `#[non_exhaustive]`.** It is produced by the
+  library and never constructed by callers, so this costs nothing today and
+  means future advertisement fields stop being breaking changes. Exhaustive
+  destructuring (`let BleDevice { id, name, rssi, services } = dev;`) needs a
+  trailing `..`.
+
+  Config and GATT structs were deliberately left constructible.
+  `#[non_exhaustive]` forbids *every* struct expression from another crate —
+  functional-update syntax included — so marking `CentralConfig` or
+  `AdvertisingConfig` would have broken the `..Default::default()` idiom
+  rather than protecting it, and left callers with no construction path
+  short of builders. Adding a field to those remains a breaking change,
+  which is the right trade while the crate is pre-1.0.
 
 - **Breaking: `PeripheralRequest::Write` gains an `offset: u16` field**,
   matching the one `PeripheralRequest::Read` already carried. Without it an

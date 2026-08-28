@@ -9,6 +9,17 @@ use uuid::Uuid;
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Configuration for initialising the central role.
+///
+/// Construct with `..Default::default()` so a new field costs you one
+/// recompile rather than an edit at every call site:
+///
+/// ```rust
+/// use blew::central::CentralConfig;
+/// let config = CentralConfig {
+///     connect_timeout: None,
+///     ..Default::default()
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct CentralConfig {
     /// On Apple platforms, passed as `CBCentralManagerOptionRestoreIdentifierKey` to

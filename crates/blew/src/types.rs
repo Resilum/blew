@@ -31,7 +31,11 @@ impl From<&str> for DeviceId {
 }
 
 /// A discovered BLE device snapshot.
+///
+/// Produced by the library, never constructed by callers, so it carries no
+/// `Default`. Match with a trailing `..` to stay forward-compatible.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BleDevice {
     pub id: DeviceId,
     pub name: Option<String>,

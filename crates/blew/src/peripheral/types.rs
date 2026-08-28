@@ -3,6 +3,9 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 /// Configuration for initialising the peripheral role.
+///
+/// Construct with `..Default::default()` so a new field costs you one
+/// recompile rather than an edit at every call site.
 #[derive(Debug, Clone, Default)]
 pub struct PeripheralConfig {
     /// On Apple platforms, passed as `CBPeripheralManagerOptionRestoreIdentifierKey` to
@@ -144,7 +147,19 @@ impl WriteResponder {
 }
 
 /// Configuration for a BLE advertisement.
-#[derive(Debug, Clone)]
+///
+/// Construct with `..Default::default()` so a new field costs you one
+/// recompile rather than an edit at every call site.
+///
+/// # Platform caveats
+///
+/// Manufacturer-specific data is deliberately absent. CoreBluetooth's
+/// `startAdvertising:` accepts only `CBAdvertisementDataLocalNameKey` and
+/// `CBAdvertisementDataServiceUUIDsKey`, so an Apple peripheral cannot
+/// advertise it at all; exposing the field here would make it a silent no-op
+/// on one of the three backends. Manufacturer data *received* while scanning
+/// is available on [`BleDevice::manufacturer_data`](crate::BleDevice).
+#[derive(Debug, Clone, Default)]
 pub struct AdvertisingConfig {
     pub local_name: String,
     pub service_uuids: Vec<Uuid>,
