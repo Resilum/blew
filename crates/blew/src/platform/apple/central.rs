@@ -139,6 +139,46 @@ impl CentralInner {
     fn emit(&self, event: CentralEvent) {
         let _ = self.event_tx.send(event);
     }
+
+    /// Fail every operation still pending on `device_id`.
+    ///
+    /// CoreBluetooth delivers no completion callback for an in-flight request
+    /// when the peer drops — `didUpdateValueForCharacteristic:` and friends
+    /// simply never fire again. None of these paths carries its own deadline
+    /// (only `connect` does), so without this the awaiting future never
+    /// resolves and its entry leaks for the lifetime of the process.
+    fn fail_pending(&self, device_id: &DeviceId) {
+        if let Some(tx) = self.connects.take(device_id) {
+            let _ = tx.send(Err(BlewError::DisconnectedDuringOperation(
+                device_id.clone(),
+            )));
+        }
+        if let Some(ds) = self.discoveries.lock().remove(device_id) {
+            let _ = ds.tx.send(Err(BlewError::DisconnectedDuringOperation(
+                device_id.clone(),
+            )));
+        }
+        for (_, tx) in self.reads.take_matching(|(id, _)| id == device_id) {
+            let _ = tx.send(Err(BlewError::DisconnectedDuringOperation(
+                device_id.clone(),
+            )));
+        }
+        for (_, tx) in self.writes.take_matching(|(id, _)| id == device_id) {
+            let _ = tx.send(Err(BlewError::DisconnectedDuringOperation(
+                device_id.clone(),
+            )));
+        }
+        for (_, tx) in self.notify_states.take_matching(|(id, _)| id == device_id) {
+            let _ = tx.send(Err(BlewError::DisconnectedDuringOperation(
+                device_id.clone(),
+            )));
+        }
+        if let Some(tx) = self.l2cap_pendings.take(device_id) {
+            let _ = tx.send(Err(BlewError::DisconnectedDuringOperation(
+                device_id.clone(),
+            )));
+        }
+    }
 }
 
 define_class!(
@@ -260,6 +300,7 @@ define_class!(
             debug!(device_id = %id, "device disconnected");
             let inner = self.ivars();
             inner.peripherals.lock().remove(&id);
+            inner.fail_pending(&id);
             let cause = if central.state() == CBManagerState::PoweredOn {
                 match error {
                     Some(err) => {

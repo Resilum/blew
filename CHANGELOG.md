@@ -5,6 +5,21 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Apple: GATT operations no longer hang forever when the peer disconnects.**
+  `centralManager:didDisconnectPeripheral:error:` now fails every request
+  still pending on that device with
+  `BlewError::DisconnectedDuringOperation`. CoreBluetooth delivers no
+  completion callback for in-flight requests when a peer drops, and none of
+  `discover_services` / `read_characteristic` / `write_characteristic` /
+  `subscribe_characteristic` / `open_l2cap_channel` carries its own deadline
+  (only `connect` does) — so a peer vanishing mid-operation previously left
+  the caller awaiting a `oneshot` that nothing would ever send, and leaked
+  the pending entry for the life of the process. Android already handled
+  this via its per-operation queue timeout; Linux surfaces bluer's D-Bus
+  errors.
+
 ### Changed
 
 - `Central::refresh` on non-Android targets is now declared as
