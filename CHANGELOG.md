@@ -7,6 +7,12 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Added
 
+- **CI now compiles the Android Kotlin.** It previously ran only ktlint, which
+  checks style and not whether the code builds, so every Kotlin change shipped
+  uncompiled. A `compile-kotlin` job builds `tauri-plugin-blew` for Android
+  (which generates the Tauri annotations the plugin sources need) and then
+  runs `compileDebugKotlin`. Locally: `mise run ci:compile-kotlin`.
+
 - The JNI parity test now compares **signatures**, not just names. It reports
   arity and per-parameter type drift between each Kotlin `external fun` and
   its Rust `extern "C"` hook — a mismatch the JVM otherwise only surfaces as a

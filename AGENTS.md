@@ -27,6 +27,7 @@ mise run lint                            # clippy
 mise run fmt                             # format
 mise run fmt:check                       # check formatting
 mise run deny                            # license/vulnerability audit
+mise run ci:compile-kotlin               # compile the Android Kotlin sources
 cargo run --example scan -p blew         # scan for 10s
 cargo run --example advertise -p blew    # advertise GATT service
 ```
