@@ -14,7 +14,7 @@
     unsafe_op_in_unsafe_fn
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -100,6 +100,28 @@ fn our_perms_to_cb(perms: AttributePermissions) -> CBAttributePermissions {
     out
 }
 
+/// A notification CoreBluetooth refused because its transmit queue was full.
+struct PendingNotify {
+    device_id: DeviceId,
+    char_uuid: Uuid,
+    value: Vec<u8>,
+    done: oneshot::Sender<BlewResult<()>>,
+}
+
+/// Result of one `updateValue:forCharacteristic:onSubscribedCentrals:` attempt.
+enum NotifyOutcome {
+    /// CoreBluetooth accepted the value into its transmit queue.
+    Sent,
+    /// The target central is no longer subscribed — treated as a no-op, matching
+    /// the pre-existing behaviour for a subscriber that disappeared mid-call.
+    SubscriberGone,
+    /// No local `CBMutableCharacteristic` is registered under that UUID.
+    CharNotFound,
+    /// The transmit queue is full. CoreBluetooth will call
+    /// `peripheralManagerIsReadyToUpdateSubscribers:` when space frees up.
+    QueueFull,
+}
+
 struct PeripheralInner {
     /// `CBMutableCharacteristic` objects keyed by UUID, for notification sending.
     chars: Mutex<HashMap<Uuid, ObjcSend<CBMutableCharacteristic>>>,
@@ -131,6 +153,17 @@ struct PeripheralInner {
     /// the GCD delegate queue is never blocked by a slow accept-stream consumer.
     #[allow(clippy::type_complexity)]
     l2cap_channel_tx: Mutex<Option<mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>>>,
+    /// Notifications CoreBluetooth refused for lack of transmit-queue space,
+    /// retried in FIFO order from `peripheralManagerIsReadyToUpdateSubscribers:`.
+    ///
+    /// This lock is held across the `updateValue:` call on both the enqueue and
+    /// the drain path. That is deliberate: CoreBluetooth only signals readiness
+    /// after an update has failed, so an attempt that raced the readiness
+    /// callback and enqueued *after* the drain had already run would never be
+    /// retried. Serialising attempt-and-enqueue against drain closes that
+    /// window. Lock order is always `pending_notifies` -> `chars` ->
+    /// `subscribers`.
+    pending_notifies: Mutex<VecDeque<PendingNotify>>,
     /// Tokio runtime handle, captured at construction time so GCD callbacks
     /// (which run off the Tokio thread) can spawn tasks onto the runtime.
     runtime: Handle,
@@ -153,6 +186,7 @@ impl PeripheralInner {
             powered_tx,
             l2cap_publish_tx: Mutex::new(None),
             l2cap_channel_tx: Mutex::new(None),
+            pending_notifies: Mutex::new(VecDeque::new()),
             runtime: Handle::current(),
         });
         (inner, powered_rx)
@@ -160,6 +194,75 @@ impl PeripheralInner {
 
     fn emit_state(&self, event: PeripheralStateEvent) {
         let _ = self.state_tx.send(event);
+    }
+
+    /// One `updateValue:forCharacteristic:onSubscribedCentrals:` attempt.
+    ///
+    /// Callers must already hold the `pending_notifies` lock — see the field
+    /// docs for why.
+    fn try_update_value(
+        &self,
+        manager: &CBPeripheralManager,
+        device_id: &DeviceId,
+        char_uuid: Uuid,
+        value: &[u8],
+    ) -> NotifyOutcome {
+        let cb_char = {
+            let lock = self.chars.lock();
+            lock.get(&char_uuid).map(|c| unsafe { retain_send(&**c) })
+        };
+        let Some(cb_char) = cb_char else {
+            return NotifyOutcome::CharNotFound;
+        };
+
+        let cb_central = {
+            let lock = self.subscribers.lock();
+            lock.get(&char_uuid)
+                .and_then(|m| m.get(device_id))
+                .map(|c| unsafe { retain_send(&**c) })
+        };
+        let Some(cb_central) = cb_central else {
+            return NotifyOutcome::SubscriberGone;
+        };
+
+        let data = NSData::from_vec(value.to_vec());
+        let centrals = NSArray::from_slice(&[cb_central.0.as_ref()]);
+        let accepted = unsafe {
+            manager.updateValue_forCharacteristic_onSubscribedCentrals(
+                &data,
+                &cb_char.0,
+                Some(&centrals),
+            )
+        };
+        if accepted {
+            NotifyOutcome::Sent
+        } else {
+            NotifyOutcome::QueueFull
+        }
+    }
+
+    /// Retry queued notifications until one is refused again or the queue empties.
+    fn drain_pending_notifies(&self, manager: &CBPeripheralManager) {
+        let mut queue = self.pending_notifies.lock();
+        while let Some(pending) = queue.front() {
+            let outcome = self.try_update_value(
+                manager,
+                &pending.device_id,
+                pending.char_uuid,
+                &pending.value,
+            );
+            if matches!(outcome, NotifyOutcome::QueueFull) {
+                break;
+            }
+            let pending = queue.pop_front().expect("front was just observed");
+            let result = match outcome {
+                NotifyOutcome::CharNotFound => Err(BlewError::LocalCharacteristicNotFound {
+                    char_uuid: pending.char_uuid,
+                }),
+                _ => Ok(()),
+            };
+            let _ = pending.done.send(result);
+        }
     }
 
     fn emit_request(&self, request: PeripheralRequest) {
@@ -481,6 +584,18 @@ define_class!(
             });
         }
 
+        /// Fires when transmit-queue space frees up after an
+        /// `updateValue:forCharacteristic:onSubscribedCentrals:` returned NO.
+        /// Without this, a refused notification would simply be lost.
+        #[unsafe(method(peripheralManagerIsReadyToUpdateSubscribers:))]
+        unsafe fn peripheralManagerIsReadyToUpdateSubscribers(
+            &self,
+            peripheral: &CBPeripheralManager,
+        ) {
+            trace!("peripheral ready to update subscribers; draining queued notifications");
+            self.ivars().drain_pending_notifies(peripheral);
+        }
+
         /// Fires when `publishL2CAPChannelWithEncryption` completes.
         /// Delivers the OS-assigned PSM (or an error) to the waiting `l2cap_listener` call.
         #[unsafe(method(peripheralManager:didPublishL2CAPChannel:error:))]
@@ -792,40 +907,37 @@ impl PeripheralBackend for ApplePeripheral {
         let device_id = device_id.clone();
         async move {
             trace!(device = %device_id, %char_uuid, len = value.len(), "notifying characteristic");
-            let cb_char = {
-                let lock = handle.inner.chars.lock();
-                lock.get(&char_uuid).map(|c| unsafe { retain_send(&**c) })
+            // Attempt and enqueue under one lock so a readiness callback cannot
+            // slip between them and leave this notification stranded.
+            let rx = {
+                let mut queue = handle.inner.pending_notifies.lock();
+                match handle
+                    .inner
+                    .try_update_value(&handle.manager, &device_id, char_uuid, &value)
+                {
+                    // A subscriber that disappeared between our caller's
+                    // decision and now is a no-op, not an error.
+                    NotifyOutcome::Sent | NotifyOutcome::SubscriberGone => return Ok(()),
+                    NotifyOutcome::CharNotFound => {
+                        return Err(BlewError::LocalCharacteristicNotFound { char_uuid });
+                    }
+                    NotifyOutcome::QueueFull => {
+                        trace!(device = %device_id, %char_uuid, "transmit queue full; queueing notification");
+                        let (tx, rx) = oneshot::channel();
+                        queue.push_back(PendingNotify {
+                            device_id,
+                            char_uuid,
+                            value,
+                            done: tx,
+                        });
+                        rx
+                    }
+                }
+                // `queue` and every ObjC temporary drop here, before the await.
             };
-
-            let Some(cb_char) = cb_char else {
-                return Err(BlewError::LocalCharacteristicNotFound { char_uuid });
-            };
-
-            let cb_central = {
-                let lock = handle.inner.subscribers.lock();
-                lock.get(&char_uuid)
-                    .and_then(|m| m.get(&device_id))
-                    .map(|c| unsafe { retain_send(&**c) })
-            };
-
-            let Some(cb_central) = cb_central else {
-                // Subscriber disappeared between our caller's decision and
-                // now — treat as no-op rather than an error.
-                return Ok(());
-            };
-
-            let data = NSData::from_vec(value);
-            let centrals = NSArray::from_slice(&[cb_central.0.as_ref()]);
-            unsafe {
-                handle
-                    .manager
-                    .updateValue_forCharacteristic_onSubscribedCentrals(
-                        &data,
-                        &cb_char.0,
-                        Some(&centrals),
-                    );
-            }
-            Ok(())
+            rx.await.unwrap_or(Err(BlewError::Internal(
+                "peripheral dropped before notification could be sent".into(),
+            )))
         }
     }
 

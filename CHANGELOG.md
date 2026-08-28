@@ -19,6 +19,17 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Fixed
 
+- **Apple: notifications are no longer silently dropped under load.**
+  `notify_characteristic` discarded the `BOOL` returned by
+  `updateValue:forCharacteristic:onSubscribedCentrals:` and reported
+  success unconditionally. A `NO` there means the transmit queue was full
+  and the value was *not* sent, and the crate implemented no
+  `peripheralManagerIsReadyToUpdateSubscribers:` delegate, so a refused
+  notification was simply lost. Refused notifications are now queued and
+  retried in FIFO order when CoreBluetooth signals readiness, and
+  `notify_characteristic` resolves only once the value has actually been
+  accepted — giving callers real backpressure instead of false success.
+
 - **Apple: GATT operations no longer hang forever when the peer disconnects.**
   `centralManager:didDisconnectPeripheral:error:` now fails every request
   still pending on that device with
