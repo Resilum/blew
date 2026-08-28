@@ -12,7 +12,9 @@ A cross-platform BLE (Bluetooth Low Energy) library for Rust, providing both Cen
 
 - L2CAP is a first-class transport, not an edge feature.
 - Designed to run with as many concurrent L2CAP channels as the device and OS will allow.
-- Backend-owned transports with explicit close/shutdown. Shared event-loop / reactor threads (Apple `L2capReactor`, Linux BlueZ, Android Kotlin coroutines) instead of per-channel worker threads. When a short-term fix is tempting, bias toward the reactor-shaped architecture anyway.
+- Backend-owned transports with explicit close/shutdown. Prefer shared event-loop / reactor threads over per-channel worker threads: Apple `L2capReactor`, Linux's native `bluer::l2cap::Stream`, and Android's per-device `GattOperationQueue` coroutines all follow this. When a short-term fix is tempting, bias toward the reactor-shaped architecture anyway.
+  - **Exception, and it is not fixable:** Android L2CAP runs one thread per channel. `BluetoothSocket` exposes only blocking `InputStream`/`OutputStream` — there is no async socket API at any API level — so a blocking read per channel is forced by the platform. The goal there is to move those onto a bounded `Dispatchers.IO` pool, not to pretend they don't exist.
+- Every L2CAP queue is bounded, and that is load-bearing rather than tidiness. L2CAP CoC is credit-based: a socket we stop reading stops returning credits, and the peer stops transmitting. An unbounded queue converts the peer's own flow control into unbounded local memory growth. Sizes come from `L2capConfig`. **Do not** reintroduce an unbounded channel on an L2CAP data path.
 
 ## Commands
 
@@ -72,8 +74,9 @@ crates/blew/src/
 │   │                             #   ReadResponder, WriteResponder, AdvertisingConfig
 │   └── backend.rs                # PeripheralBackend sealed trait
 ├── l2cap/
-│   ├── mod.rs                    # L2capChannel (AsyncRead + AsyncWrite) with close hook
-│   └── types.rs                  # Psm(u16) newtype
+│   ├── mod.rs                    # L2capChannel (AsyncRead + AsyncWrite), DuplexBridge,
+│   │                             #   CloseReasonSlot, flush-on-close
+│   └── types.rs                  # Psm(u16), L2capConfig, L2capCloseReason
 ├── platform/
 │   ├── mod.rs                    # #[cfg] type aliases: PlatformCentral, PlatformPeripheral
 │   ├── apple/
@@ -160,14 +163,21 @@ rx.await...
 
 **RAII responders:** `peripheralManager:didReceiveReadRequest:` and `didReceiveWriteRequests:` build a `ReadResponder`/`WriteResponder` (backed by an `oneshot::Sender`), emit a `PeripheralRequest` on the `mpsc::UnboundedSender` handed out by `take_requests()`, then spawn a task (via `inner.runtime.spawn()`) that awaits the oneshot and calls `respondToRequest:withResult:`. The spawn uses the captured `Handle` because GCD callbacks run outside the Tokio runtime context — bare `tokio::spawn` would panic. All Rust-side synchronization uses `parking_lot::Mutex` (poison-free, faster than `std::sync::Mutex`).
 
-**L2CAP reactor** (`platform/apple/l2cap.rs`): one dedicated OS thread owns an `NSRunLoop` and all `NSInputStream`/`NSOutputStream` objects. Channels register via `ReactorCmd::Register { id, channel_ref, input, output, inbound_tx }`, writes go via `ReactorCmd::Write`, close via `ReactorCmd::Close`. Bytes flow Reactor→App through `mpsc::UnboundedSender<Vec<u8>>`; App→Reactor through a `tokio::io::duplex` + outbound bridge task. No per-channel threads.
+**L2CAP reactor** (`platform/apple/l2cap.rs`): one dedicated OS thread owns an `NSRunLoop` and all `NSInputStream`/`NSOutputStream` objects. Channels register via `ReactorCmd::Register`, close via `ReactorCmd::Close`; there is no write command — each channel carries a bounded `outbound_rx` the reactor drains itself, so backpressure lands on the caller's `write()` instead of in a queue. Bytes flow Reactor→App through a bounded `mpsc::Sender<Vec<u8>>`, App→Reactor through a `tokio::io::duplex` + outbound bridge task. No per-channel threads. The loop is still a 50 ms poll rather than `NSStreamDelegate`-driven; making it event-driven is open work.
 
-**L2CAP close invariant:** exactly one `ReactorCmd::Close` per channel. `DuplexTransport::trigger_close` uses `Option::take` on the close hook so `.close().await` and `Drop` both route to the same single-fire path. **Do not** add defensive `ReactorCmd::Close` sends from the bridge tasks — the hook is the only sender.
+**L2CAP close invariant:** exactly one `ReactorCmd::Close` per channel. `DuplexTransport::trigger_close` uses `Option::take` on the close hook so `.close().await` and `Drop` both route to the same single-fire path. **Do not** add defensive `ReactorCmd::Close` sends from the bridge tasks — the hook is the only sender. `close()` additionally shuts the write side and waits (bounded by `L2capConfig::flush_timeout`) for the backend's `flushed` signal before firing the hook; `Drop` skips that, because it cannot await.
 
-**L2CAP accept channel policy:**
+**L2CAP accept channel policy.** This governs the *accept* path only — the
+stream of newly-arrived channels. Every L2CAP **data** path is bounded; see the
+flow-control rule under Project goals.
 - Apple: `mpsc::unbounded_channel()`. Blocking the GCD delegate queue on `blocking_send` would stall every subsequent CB callback (disconnects, restore, etc.).
 - Android: `mpsc::unbounded_channel()`. `try_send` on a bounded channel would silently drop incoming L2CAP connections.
 - Linux: `mpsc::channel(16)` + `send().await`. Backpressure flows into BlueZ's kernel-side socket accept queue, which is the right place to cap.
+
+**L2CAP data path invariants (Apple + Android):**
+- Reserve inbound capacity *before* reading the socket. A byte read out is a byte whose L2CAP credit has already been returned to the peer, so reading with nowhere to put it is exactly the unbounded-buffering bug.
+- Apple: never call `write:maxLength:` without `hasSpaceAvailable`. Without the check it either blocks the shared reactor thread — stalling every other channel — or returns a non-positive value that reads like a dead channel. Only a real stream error (`streamStatus == Error`, or a negative return) closes a channel; "no space" means wait.
+- Android: `on_channel_data` uses `blocking_send`, which is safe *only* because it runs on Kotlin's per-socket read thread rather than a Tokio worker. Blocking that thread is the intended backpressure.
 
 ## Event fan-out convention
 
@@ -284,7 +294,7 @@ rx.await?; // safe to await now
   match precisely.
 - Overlapping `connect()` on the same device is rejected with
   `BlewError::ConnectInFlight(DeviceId)` on Apple and Android (built on
-  `KeyedRequestMap::try_insert`). Linux relies on bluer's own state machine.
+  `KeyedRequestMap::try_insert`) and on Linux (`CentralInner::pending_connects`).
   Do not reintroduce "latest wins" eviction — it silently orphans the first
   caller's oneshot.
 - Android `disconnect()` **awaits** `onConnectionStateChange(DISCONNECTED)`
