@@ -47,6 +47,10 @@ const L2CAP_PAYLOAD_LEN: usize = 1024;
 const SPEEDTEST_BYTES: usize = 1024 * 1024;
 const BIDIRECTIONAL_SPEEDTEST_BYTES: usize = 500 * 1024;
 const SPEEDTEST_CHUNK_SIZE: usize = 4096;
+/// Per-channel payload for the concurrent phase. Smaller than the
+/// single-channel speedtest because N channels share one radio.
+const CONCURRENT_CHANNEL_BYTES: usize = 256 * 1024;
+const CONCURRENT_TIMEOUT: Duration = Duration::from_secs(300);
 const PROGRESS_YIELD_INTERVAL: usize = 64 * 1024;
 const PROGRESS_PRINT_INTERVAL: Duration = Duration::from_secs(1);
 const CMD_ECHO: u8 = 0x01;
@@ -286,6 +290,124 @@ async fn run_bidirectional_speedtest(
     Ok(progress.start.elapsed())
 }
 
+/// One channel's share of the concurrent phase: upload `bytes` and consume the
+/// peripheral's progress reports. Quiet -- the caller reports in aggregate,
+/// since N channels each printing progress is unreadable.
+async fn run_concurrent_upload(
+    ch: &mut blew::L2capChannel,
+    bytes: usize,
+) -> Result<Duration, String> {
+    write_command_header(ch, CMD_UPLOAD, bytes)
+        .await
+        .map_err(|e| format!("header: {e}"))?;
+    let started = Instant::now();
+    let (mut reader, mut writer) = tokio::io::split(ch);
+
+    let sender = async {
+        let chunk = [CENTRAL_PATTERN; SPEEDTEST_CHUNK_SIZE];
+        let mut remaining = bytes;
+        let mut since_yield = 0_usize;
+        while remaining > 0 {
+            let n = remaining.min(SPEEDTEST_CHUNK_SIZE);
+            writer.write_all(&chunk[..n]).await?;
+            remaining -= n;
+            since_yield += n;
+            if since_yield >= PROGRESS_YIELD_INTERVAL {
+                since_yield = 0;
+                tokio::task::yield_now().await;
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    };
+
+    let receiver = async {
+        let mut last = 0_usize;
+        while last < bytes {
+            let mut report = [0_u8; 4];
+            reader.read_exact(&mut report).await?;
+            let seen = usize::try_from(u32::from_le_bytes(report)).expect("progress fits in usize");
+            if seen < last || seen > bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid upload progress report",
+                ));
+            }
+            last = seen;
+        }
+        Ok::<(), std::io::Error>(())
+    };
+
+    tokio::try_join!(sender, receiver).map_err(|e| format!("transfer: {e}"))?;
+    Ok(started.elapsed())
+}
+
+/// Drive `channels` L2CAP channels at once and report aggregate throughput.
+///
+/// This is the shape that exposes head-of-line blocking between channels and
+/// whether backpressure on one starves the others; a single-channel speedtest
+/// cannot show either.
+async fn run_concurrent_phase(
+    central: &Central,
+    device_id: &blew::DeviceId,
+    psm: Psm,
+    channels: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("\nl2cap concurrent: opening {channels} channels");
+
+    // Sequential on purpose. The Apple backend keys pending L2CAP opens by
+    // device, so a second open to the same peer while one is in flight evicts
+    // the first caller's waiter. Opening one at a time is the supported
+    // pattern; see `l2cap_pendings` in platform/apple/central.rs.
+    let mut opened = Vec::with_capacity(channels);
+    for i in 0..channels {
+        let ch = timeout(OP_TIMEOUT, central.open_l2cap_channel(device_id, psm))
+            .await
+            .map_err(|_| format!("open L2CAP channel {i} timed out"))??;
+        opened.push(ch);
+    }
+    println!("l2cap concurrent: {channels} channels open");
+
+    let wall_start = Instant::now();
+    let mut tasks = Vec::with_capacity(channels);
+    for (i, mut ch) in opened.into_iter().enumerate() {
+        tasks.push(tokio::spawn(async move {
+            let elapsed = run_concurrent_upload(&mut ch, CONCURRENT_CHANNEL_BYTES).await;
+            // Close explicitly so the linger path is exercised too.
+            let _ = ch.close().await;
+            (i, elapsed)
+        }));
+    }
+
+    let mut per_channel = Vec::with_capacity(channels);
+    for task in tasks {
+        let (i, elapsed) = timeout(CONCURRENT_TIMEOUT, task)
+            .await
+            .map_err(|_| "concurrent phase timed out")?
+            .map_err(|e| format!("concurrent channel task panicked: {e}"))?;
+        let elapsed = elapsed.map_err(|e| format!("channel {i}: {e}"))?;
+        per_channel.push((i, elapsed));
+    }
+    let wall = wall_start.elapsed();
+
+    per_channel.sort_by_key(|(_, elapsed)| *elapsed);
+    for (i, elapsed) in &per_channel {
+        print_speed(
+            &format!("  channel {i}"),
+            CONCURRENT_CHANNEL_BYTES,
+            *elapsed,
+        );
+    }
+    let total = CONCURRENT_CHANNEL_BYTES * channels;
+    print_speed("l2cap concurrent aggregate", total, wall);
+
+    // A large spread means one channel is starving the others -- the
+    // head-of-line symptom worth eyeballing across runs.
+    if let (Some((_, fastest)), Some((_, slowest))) = (per_channel.first(), per_channel.last()) {
+        println!("l2cap concurrent spread: fastest {fastest:.2?}, slowest {slowest:.2?}");
+    }
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -306,6 +428,27 @@ async fn main() -> ExitCode {
 
 #[allow(clippy::too_many_lines)]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // `--channels N` adds a phase that drives N L2CAP channels at once after
+    // the single-channel suite. Needs the peripheral started with
+    // `--keep-alive`, which otherwise exits after the first session ends.
+    let mut args = std::env::args().skip(1);
+    let mut channels = 1_usize;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--channels" => {
+                channels = args
+                    .next()
+                    .ok_or("--channels needs a value")?
+                    .parse()
+                    .map_err(|e| format!("--channels: {e}"))?;
+                if channels == 0 {
+                    return Err("--channels must be at least 1".into());
+                }
+            }
+            other => return Err(format!("unknown argument: {other}").into()),
+        }
+    }
+
     let central: Central = Central::new().await?;
     let mut events = central.events();
 
@@ -487,6 +630,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         BIDIRECTIONAL_SPEEDTEST_BYTES * 2,
         bidirectional_elapsed,
     );
+
+    if channels > 1 {
+        run_concurrent_phase(&central, &device_id, psm, channels).await?;
+    }
 
     let _ = timeout(
         OP_TIMEOUT,

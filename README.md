@@ -73,6 +73,27 @@ The protocol covers scan + connect + service discovery, read of a fixed
 status characteristic, a write-then-notify round-trip, and an L2CAP CoC
 echo. On success the central prints `integration-central: PASS` and exits 0.
 
+### Concurrent L2CAP channels
+
+`blew` aims to sustain as many concurrent L2CAP channels as the platform
+allows, and a single-channel speedtest cannot show whether it does. Pass
+`--channels N` to add a phase that drives N channels at once and reports
+per-channel and aggregate throughput:
+
+```sh
+# host A -- --keep-alive is required; the peripheral otherwise exits after
+# the first L2CAP session ends
+cargo run --example integration_peripheral -p blew -- --keep-alive
+
+# host B
+cargo run --example integration_central -p blew -- --channels 8
+```
+
+What to look at is the **spread** between the fastest and slowest channel,
+printed at the end. Aggregate throughput close to the single-channel number
+with a wide spread means one channel is starving the others; that is the
+head-of-line-blocking symptom, and it is invisible at `--channels 1`.
+
 ## Alternative Libraries
 
 This library was customized primarily to be used for Iroh, and there are plenty

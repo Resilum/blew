@@ -782,7 +782,7 @@ mod tests {
     #[test]
     fn a_none_deadline_drains_indefinitely() {
         let start = Instant::now();
-        let much_later = start + Duration::from_secs(86_400);
+        let much_later = start + Duration::from_hours(24);
         assert!(!linger_finished(
             Some(start),
             false,
