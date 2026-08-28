@@ -7,6 +7,19 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Added
 
+- **`BleDevice::manufacturer_data` and `BleDevice::service_data`.**
+  Manufacturer-specific data is how most peer-to-peer BLE apps establish
+  identity at discovery time, and every backend was already receiving it from
+  the OS and discarding it. `manufacturer_data` is keyed by the 16-bit
+  Bluetooth SIG company identifier, `service_data` by service UUID; both are
+  empty when the peer advertised none.
+
+  There is deliberately no matching field on `AdvertisingConfig`.
+  CoreBluetooth's `startAdvertising:` accepts only
+  `CBAdvertisementDataLocalNameKey` and `CBAdvertisementDataServiceUUIDsKey`,
+  so an Apple peripheral cannot advertise manufacturer data at all — exposing
+  it would make the field a silent no-op on one of three backends.
+
 - `Default` for `GattService`, `GattCharacteristic`, `GattDescriptor`,
   `CharacteristicProperties` and `AttributePermissions`, plus
   `AdvertisingConfig`, so all of them can be built with the

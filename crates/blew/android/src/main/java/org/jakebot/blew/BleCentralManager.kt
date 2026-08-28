@@ -88,6 +88,8 @@ object BleCentralManager {
         deviceName: String?,
         rssi: Int,
         serviceUuids: String,
+        manufacturerData: String,
+        serviceData: String,
     )
 
     @JvmStatic
@@ -245,7 +247,23 @@ object BleCentralManager {
                             ?.joinToString(",") { it.uuid.toString() }
                             ?: ""
 
-                    nativeOnDeviceDiscovered(addr, name, rssi, uuids)
+                    // "<companyId>:<hex>" entries, comma separated, matching the
+                    // comma-joined encoding already used for service UUIDs.
+                    val manufacturerData =
+                        result.scanRecord?.manufacturerSpecificData?.let { sparse ->
+                            (0 until sparse.size()).joinToString(",") { i ->
+                                "${sparse.keyAt(i)}:${sparse.valueAt(i).toHex()}"
+                            }
+                        } ?: ""
+
+                    val serviceData =
+                        result.scanRecord
+                            ?.serviceData
+                            ?.entries
+                            ?.joinToString(",") { (uuid, bytes) -> "${uuid.uuid}:${bytes.toHex()}" }
+                            ?: ""
+
+                    nativeOnDeviceDiscovered(addr, name, rssi, uuids, manufacturerData, serviceData)
                 }
 
                 override fun onScanFailed(errorCode: Int) {
@@ -768,6 +786,12 @@ object BleCentralManager {
     fun closeL2cap(socketId: Int) = l2cap.close(socketId)
 
     // ── Helpers ──
+
+    private fun ByteArray.toHex(): String {
+        val sb = StringBuilder(size * 2)
+        for (b in this) sb.append("%02x".format(b))
+        return sb.toString()
+    }
 
     private fun findCharacteristic(
         gatt: BluetoothGatt,

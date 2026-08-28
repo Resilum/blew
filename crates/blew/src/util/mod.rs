@@ -1,3 +1,4 @@
+pub mod adv_data;
 pub mod event_stream;
 pub mod request_map;
 

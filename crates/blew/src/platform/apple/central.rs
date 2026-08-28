@@ -30,7 +30,8 @@ use objc2::{AnyThread, DefinedClass};
 use objc2_core_bluetooth::CBCentralManagerOptionRestoreIdentifierKey;
 use objc2_core_bluetooth::CBCentralManagerRestoredStatePeripheralsKey;
 use objc2_core_bluetooth::{
-    CBAdvertisementDataLocalNameKey, CBAdvertisementDataServiceUUIDsKey, CBCentralManager,
+    CBAdvertisementDataLocalNameKey, CBAdvertisementDataManufacturerDataKey,
+    CBAdvertisementDataServiceDataKey, CBAdvertisementDataServiceUUIDsKey, CBCentralManager,
     CBCentralManagerDelegate, CBCharacteristic, CBCharacteristicProperties,
     CBCharacteristicWriteType, CBError, CBErrorDomain, CBL2CAPChannel, CBManagerState,
     CBPeripheral, CBPeripheralDelegate, CBService, CBUUID,
@@ -231,12 +232,49 @@ define_class!(
                 })
                 .unwrap_or_default();
 
+            // A manufacturer-data field is a 2-byte little-endian company
+            // identifier followed by the vendor payload. Anything shorter has
+            // no identifier and is discarded.
+            let manufacturer_data = advertisement_data
+                .objectForKey(CBAdvertisementDataManufacturerDataKey)
+                .and_then(|obj| {
+                    let data: &NSData = (*obj).downcast_ref::<NSData>()?;
+                    let bytes = data.to_vec();
+                    let (company, payload) = bytes.split_at_checked(2)?;
+                    Some(HashMap::from([(
+                        u16::from_le_bytes([company[0], company[1]]),
+                        payload.to_vec(),
+                    )]))
+                })
+                .unwrap_or_default();
+
+            let service_data = advertisement_data
+                .objectForKey(CBAdvertisementDataServiceDataKey)
+                .map(|obj| {
+                    // SAFETY: CoreBluetooth guarantees this key's value is
+                    // NSDictionary<CBUUID, NSData>.
+                    let dict: Retained<NSDictionary<CBUUID, NSData>> =
+                        Retained::cast_unchecked(obj);
+                    let mut out = HashMap::new();
+                    for key in dict.allKeys().to_vec() {
+                        if let Some(uuid) = cbuuid_to_uuid(&key)
+                            && let Some(value) = dict.objectForKey(&key)
+                        {
+                            out.insert(uuid, value.to_vec());
+                        }
+                    }
+                    out
+                })
+                .unwrap_or_default();
+
             let rssi_val = rssi.integerValue() as i16;
             let device = BleDevice {
                 id: id.clone(),
                 name,
                 rssi: Some(rssi_val),
                 services,
+                manufacturer_data,
+                service_data,
             };
             debug!(device_id = %id, name = ?device.name, rssi = rssi_val, "device discovered");
             let inner = self.ivars();
@@ -344,11 +382,15 @@ define_class!(
             for peripheral in arr.to_vec() {
                 let id = peripheral_device_id(&peripheral);
                 let name = peripheral.name().map(|n| n.to_string());
+                // Restoration hands back peripherals, not advertisements, so
+                // there is no advertisement payload to recover here.
                 let device = BleDevice {
                     id: id.clone(),
                     name,
                     rssi: None,
                     services: vec![],
+                    manufacturer_data: HashMap::new(),
+                    service_data: HashMap::new(),
                 };
                 inner
                     .peripherals

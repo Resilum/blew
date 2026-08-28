@@ -294,6 +294,8 @@ impl CentralBackend for MockCentral {
                     name,
                     rssi: Some(-50),
                     services,
+                    manufacturer_data: HashMap::new(),
+                    service_data: HashMap::new(),
                 }));
             }
             Ok(())
@@ -1940,6 +1942,8 @@ mod tests {
             name: Some("restored".into()),
             rssi: None,
             services: vec![],
+            manufacturer_data: HashMap::new(),
+            service_data: HashMap::new(),
         };
         central.backend.mock_set_restored(vec![device.clone()]);
 

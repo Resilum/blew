@@ -331,6 +331,8 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnDeviceD
     device_name: JString,
     rssi: jint,
     service_uuids_str: JString,
+    manufacturer_data_str: JString,
+    service_data_str: JString,
 ) {
     guard("nativeOnDeviceDiscovered", || {
         env.with_env(|env| {
@@ -346,11 +348,22 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnDeviceD
                 .filter_map(|s| s.parse().ok())
                 .collect();
 
+            let manufacturer_data = crate::util::adv_data::parse_keyed_hex(
+                &jstring_to_string(env, &manufacturer_data_str).unwrap_or_default(),
+                |k| k.parse::<u16>().ok(),
+            );
+            let service_data = crate::util::adv_data::parse_keyed_hex(
+                &jstring_to_string(env, &service_data_str).unwrap_or_default(),
+                |k| k.parse::<Uuid>().ok(),
+            );
+
             let device = BleDevice {
                 id: DeviceId::from(addr.as_str()),
                 name,
                 rssi: Some(rssi as i16),
                 services,
+                manufacturer_data,
+                service_data,
             };
 
             trace!(addr, "device discovered");

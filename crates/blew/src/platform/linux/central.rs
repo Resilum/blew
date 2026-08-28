@@ -412,11 +412,25 @@ impl CentralBackend for LinuxCentral {
                                 .unwrap_or_default();
                             let device_id = DeviceId(addr.to_string());
                             debug!(device_id = %device_id, name = ?name, rssi = ?rssi, "device discovered");
+                            let manufacturer_data = device
+                                .manufacturer_data()
+                                .await
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default();
+                            let service_data = device
+                                .service_data()
+                                .await
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default();
                             let ble_device = BleDevice {
                                 id: device_id.clone(),
                                 name,
                                 rssi,
                                 services,
+                                manufacturer_data,
+                                service_data,
                             };
                             handle
                                 .discovered
