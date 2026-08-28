@@ -18,14 +18,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{BlewError, BlewResult};
-use crate::l2cap::L2capChannel;
-use crate::l2cap::types::Psm;
+use crate::l2cap::types::{L2capCloseReason, L2capConfig, Psm};
+use crate::l2cap::{CloseReasonSlot, DuplexBridge, L2capChannel};
 use crate::types::DeviceId;
 
 use super::jni_globals::{central_class, jvm, peripheral_class};
 
-const DUPLEX_BUF_SIZE: usize = 65536;
-const L2CAP_READ_BUF_SIZE: usize = 4096;
+/// Smallest number of queued chunks, so a tiny `buffer_size` can never produce
+/// a zero-capacity channel (which would deadlock).
+const MIN_QUEUE_CHUNKS: usize = 2;
 
 type AcceptSender = mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>;
 
@@ -33,7 +34,23 @@ struct L2capState {
     pending_server: Mutex<Option<oneshot::Sender<BlewResult<Psm>>>>,
     pending_open: Mutex<HashMap<String, oneshot::Sender<BlewResult<L2capChannel>>>>,
     accept_tx: Mutex<Option<AcceptSender>>,
-    data_tx: Mutex<HashMap<i32, mpsc::UnboundedSender<Vec<u8>>>>,
+    /// Bounded per-socket inbound queues. The Kotlin read thread blocks on a
+    /// full queue, which stops it draining the socket, which stops L2CAP
+    /// credits being returned, which stops the peer sending. That chain is the
+    /// whole backpressure mechanism.
+    data_tx: Mutex<HashMap<i32, mpsc::Sender<Vec<u8>>>>,
+    close_reasons: Mutex<HashMap<i32, CloseReasonSlot>>,
+    /// Central and peripheral can be configured independently; `from_server`
+    /// on the open callback says which side a socket belongs to.
+    client_config: Mutex<L2capConfig>,
+    server_config: Mutex<L2capConfig>,
+}
+
+fn queue_capacity(config: &L2capConfig) -> usize {
+    config
+        .buffer_size
+        .div_ceil(config.read_chunk_size.max(1))
+        .max(MIN_QUEUE_CHUNKS)
 }
 
 static STATE: OnceLock<L2capState> = OnceLock::new();
@@ -53,8 +70,23 @@ pub(crate) fn init_statics() {
         pending_open: Mutex::new(HashMap::new()),
         accept_tx: Mutex::new(None),
         data_tx: Mutex::new(HashMap::new()),
+        close_reasons: Mutex::new(HashMap::new()),
+        client_config: Mutex::new(L2capConfig::default()),
+        server_config: Mutex::new(L2capConfig::default()),
     });
     let _ = TOKIO_HANDLE.set(tokio::runtime::Handle::current());
+}
+
+pub(crate) fn set_client_config(config: L2capConfig) {
+    if let Some(s) = STATE.get() {
+        *s.client_config.lock() = config;
+    }
+}
+
+pub(crate) fn set_server_config(config: L2capConfig) {
+    if let Some(s) = STATE.get() {
+        *s.server_config.lock() = config;
+    }
 }
 
 pub(crate) fn set_pending_server(tx: oneshot::Sender<BlewResult<Psm>>) {
@@ -95,13 +127,27 @@ fn close_socket(socket_id: i32, is_server: bool) {
 }
 
 pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: bool) {
-    let (app_half, bridge_half) = tokio::io::duplex(DUPLEX_BUF_SIZE);
+    let config = STATE.get().map_or_else(L2capConfig::default, |s| {
+        if from_server {
+            s.server_config.lock().clone()
+        } else {
+            s.client_config.lock().clone()
+        }
+    });
+    let read_chunk = config.read_chunk_size.max(1);
+
+    let (app_half, bridge_half) = tokio::io::duplex(config.buffer_size);
     let (mut bridge_reader, mut bridge_writer) = tokio::io::split(bridge_half);
 
-    let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(queue_capacity(&config));
+    let close_reason = CloseReasonSlot::default();
     if let Some(s) = STATE.get() {
         s.data_tx.lock().insert(socket_id, data_tx);
+        s.close_reasons
+            .lock()
+            .insert(socket_id, close_reason.clone());
     }
+    let (flushed_tx, flushed_rx) = oneshot::channel();
 
     let handle = TOKIO_HANDLE.get().expect("tokio handle not initialized");
 
@@ -115,7 +161,8 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
 
     let is_server = from_server;
     handle.spawn(async move {
-        let mut buf = vec![0_u8; L2CAP_READ_BUF_SIZE];
+        let mut buf = vec![0_u8; read_chunk];
+        let mut flushed_tx = Some(flushed_tx);
         loop {
             match bridge_reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -142,11 +189,23 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
                 }
             }
         }
+        // Every byte handed to Kotlin has already been written to the socket --
+        // writeL2cap is synchronous -- so reaching here means the outbound
+        // queue is drained and a waiting `close()` can proceed.
+        if let Some(flushed) = flushed_tx.take() {
+            let _ = flushed.send(());
+        }
         close_socket(socket_id, is_server);
     });
 
-    let channel = L2capChannel::from_duplex_with_close_hook(app_half, move || {
-        close_socket(socket_id, from_server);
+    let channel = L2capChannel::from_bridge(DuplexBridge {
+        inner: app_half,
+        close_hook: Some(Box::new(move || {
+            close_socket(socket_id, from_server);
+        })),
+        close_reason,
+        flushed: Some(flushed_rx),
+        flush_timeout: config.flush_timeout,
     });
 
     if from_server {
@@ -169,16 +228,24 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
 }
 
 pub(crate) fn on_channel_data(socket_id: i32, data: &[u8]) {
-    if let Some(s) = STATE.get()
-        && let Some(tx) = s.data_tx.lock().get(&socket_id)
-    {
-        let _ = tx.send(data.to_vec());
-    }
+    let Some(s) = STATE.get() else { return };
+    // Clone the sender out rather than holding the map lock across the blocking
+    // send below, which would stall every other socket's callbacks.
+    let Some(tx) = s.data_tx.lock().get(&socket_id).cloned() else {
+        return;
+    };
+    // Called on Kotlin's per-socket read thread, never a Tokio worker, so
+    // blocking here is safe -- and is precisely the backpressure we want: the
+    // thread stops draining the socket and the peer runs out of L2CAP credits.
+    let _ = tx.blocking_send(data.to_vec());
 }
 
 pub(crate) fn on_channel_closed(socket_id: i32) {
     if let Some(s) = STATE.get() {
         s.data_tx.lock().remove(&socket_id);
+        if let Some(slot) = s.close_reasons.lock().remove(&socket_id) {
+            slot.set(L2capCloseReason::Closed);
+        }
     }
 }
 

@@ -7,6 +7,31 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Added
 
+- **`L2capConfig`**, on `CentralConfig::l2cap` and `PeripheralConfig::l2cap`:
+  `buffer_size`, `read_chunk_size` and `flush_timeout`. Linux observes none of
+  them — `bluer::l2cap::Stream` is already an async byte stream handed straight
+  to the caller, so there is no in-process bridge to size and nothing queued
+  locally to flush. Apple and Android observe all three.
+- **`L2capChannel::close_reason()` and `L2capCloseReason`.** A dropped ACL link
+  and a polite hangup previously both surfaced as a clean end-of-stream.
+  `LinkLost` and `TransportError` now also surface from `AsyncRead` as an
+  `io::Error` (`ConnectionReset` and `Other` respectively), so a failure is no
+  longer indistinguishable from the peer closing normally.
+- `Psm` now implements `Display`.
+
+### Changed
+
+- **`L2capChannel::close()` flushes before tearing down.** It shuts the write
+  side, waits up to `L2capConfig::flush_timeout` (default 1s) for the backend
+  to report its outbound queue drained, then closes. A timeout is not an error
+  — the channel closes regardless, since the alternative is hanging on a peer
+  that has stopped granting credits. Dropping a channel still tears down
+  immediately and discards anything queued, because `Drop` cannot await.
+- **Breaking: `Peripheral::l2cap_listener` and `Central::open_l2cap_channel`
+  now report an unusable channel as an error.** Apple previously logged a
+  warning and returned a channel whose peer half had already been dropped, so
+  the caller got `Ok(channel)` and an immediate EOF.
+
 - **`BleDevice::manufacturer_data` and `BleDevice::service_data`.**
   Manufacturer-specific data is how most peer-to-peer BLE apps establish
   identity at discovery time, and every backend was already receiving it from
@@ -55,6 +80,25 @@ All notable changes to `blew` are documented here. Format follows
   new `clippy::unused_async_trait_impl` error that broke the CI lint gate.
 
 ### Fixed
+
+- **L2CAP no longer buffers without limit in either direction.** Every queue
+  between the application and the platform socket on Apple and Android was
+  unbounded: the Apple reactor's command channel and inbound channel, and
+  Android's inbound channel. A peer faster than the application (or an
+  application faster than the peer) grew memory without limit, per channel.
+  All are now bounded from `L2capConfig`, and — the point of the exercise —
+  the backends stop *reading* the socket when the queue is full. L2CAP CoC is
+  credit-based, so an unread socket stops returning credits and the peer stops
+  transmitting. The unbounded queues were converting the protocol's own flow
+  control into local memory growth.
+
+- **Apple: a busy L2CAP channel is no longer torn down instead of throttled.**
+  The reactor called `write:maxLength:` without first checking
+  `hasSpaceAvailable`, and treated the resulting non-positive return as a dead
+  channel — so a channel that merely filled its transmit buffer was destroyed.
+  The same call could instead block, stalling the single reactor thread and
+  with it every other channel. Writes now happen only against reported space,
+  partial writes are resumed, and only a real stream error closes the channel.
 
 - **Linux: spontaneous disconnects are now reported.** `DeviceDisconnected`
   was only emitted on an explicit `disconnect()`, a connect timeout, or a

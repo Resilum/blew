@@ -148,6 +148,7 @@ struct PeripheralInner {
     /// Powered state watch.
     powered_tx: watch::Sender<bool>,
     /// Result of `publishL2CAPChannelWithEncryption` -- carries the assigned PSM.
+    l2cap_config: Mutex<crate::l2cap::L2capConfig>,
     l2cap_publish_tx: Mutex<Option<oneshot::Sender<BlewResult<Psm>>>>,
     /// Sender for incoming L2CAP channels (set by `l2cap_listener`). Unbounded so
     /// the GCD delegate queue is never blocked by a slow accept-stream consumer.
@@ -184,6 +185,7 @@ impl PeripheralInner {
             state_tx,
             restored: Mutex::new(None),
             powered_tx,
+            l2cap_config: Mutex::new(crate::l2cap::L2capConfig::default()),
             l2cap_publish_tx: Mutex::new(None),
             l2cap_channel_tx: Mutex::new(None),
             pending_notifies: Mutex::new(VecDeque::new()),
@@ -653,8 +655,18 @@ define_class!(
                 DeviceId::from("unknown")
             };
 
-            let l2cap = bridge_l2cap_channel(ch, &inner.runtime);
-            let _ = tx.send(Ok((device_id, l2cap)));
+            let config = inner.l2cap_config.lock().clone();
+            match bridge_l2cap_channel(ch, &inner.runtime, &config) {
+                Ok(l2cap) => {
+                    let _ = tx.send(Ok((device_id, l2cap)));
+                }
+                Err(reason) => {
+                    warn!(?reason, "apple L2CAP channel unusable");
+                    let _ = tx.send(Err(BlewError::L2cap {
+                        source: format!("{reason:?}").into(),
+                    }));
+                }
+            }
         }
     }
 );
@@ -679,10 +691,9 @@ unsafe impl Sync for PeripheralHandle {}
 pub struct ApplePeripheral(Arc<PeripheralHandle>);
 
 impl ApplePeripheral {
-    pub async fn with_config(
-        #[cfg_attr(not(target_os = "ios"), allow(unused))] config: PeripheralConfig,
-    ) -> BlewResult<Self> {
+    pub async fn with_config(config: PeripheralConfig) -> BlewResult<Self> {
         let (inner, mut powered_rx) = PeripheralInner::new();
+        *inner.l2cap_config.lock() = config.l2cap.clone();
         let delegate = PeripheralDelegate::new(Arc::clone(&inner));
 
         let queue = DispatchQueue::new("blew.peripheral", DispatchQueueAttr::SERIAL);

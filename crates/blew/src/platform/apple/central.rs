@@ -94,6 +94,7 @@ struct CentralInner {
     discovered: Mutex<HashMap<DeviceId, BleDevice>>,
     connects: KeyedRequestMap<DeviceId, oneshot::Sender<BlewResult<()>>>,
     connect_timeout: Mutex<Option<std::time::Duration>>,
+    l2cap_config: Mutex<crate::l2cap::L2capConfig>,
     // `discoveries` keeps a mutable `DiscoveryState` per device (services
     // accumulate across multiple didDiscoverCharacteristicsForService
     // callbacks), so it needs `get_mut` and can't use KeyedRequestMap.
@@ -124,6 +125,7 @@ impl CentralInner {
             discovered: Default::default(),
             connects: Default::default(),
             connect_timeout: Mutex::new(None),
+            l2cap_config: Mutex::new(crate::l2cap::L2capConfig::default()),
             discoveries: Default::default(),
             reads: Default::default(),
             writes: Default::default(),
@@ -621,8 +623,13 @@ define_class!(
                 return;
             };
             debug!(device_id = %id, "L2CAP channel opened");
-            let l2cap = bridge_l2cap_channel(ch, &inner.runtime);
-            let _ = tx.send(Ok(l2cap));
+            let config = inner.l2cap_config.lock().clone();
+            let result = bridge_l2cap_channel(ch, &inner.runtime, &config).map_err(|reason| {
+                BlewError::L2cap {
+                    source: format!("{reason:?}").into(),
+                }
+            });
+            let _ = tx.send(result);
         }
     }
 );
@@ -1025,6 +1032,7 @@ impl AppleCentral {
     pub async fn with_config(config: CentralConfig) -> BlewResult<Self> {
         let (inner, mut powered_rx) = CentralInner::new();
         *inner.connect_timeout.lock() = config.connect_timeout;
+        *inner.l2cap_config.lock() = config.l2cap.clone();
         let delegate = CentralDelegate::new(Arc::clone(&inner));
         let queue = DispatchQueue::new("blew.central", DispatchQueueAttr::SERIAL);
 

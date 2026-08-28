@@ -199,6 +199,7 @@ impl AndroidCentral {
             return Err(BlewError::PermissionDenied);
         }
         init_statics(config.connect_timeout);
+        super::l2cap_state::set_client_config(config.l2cap.clone());
         debug!(connect_timeout = ?config.connect_timeout, "AndroidCentral initialized");
         Ok(AndroidCentral)
     }

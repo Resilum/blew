@@ -1,3 +1,4 @@
+use crate::l2cap::L2capConfig;
 use crate::types::{BleDevice, DeviceId};
 use bytes::Bytes;
 use std::time::Duration;
@@ -31,6 +32,8 @@ pub struct CentralConfig {
     /// [`BlewError::ConnectTimedOut`](crate::error::BlewError::ConnectTimedOut)
     /// if the connection has not completed within `d`.
     pub connect_timeout: Option<Duration>,
+    /// Tuning applied to L2CAP channels opened by this central.
+    pub l2cap: L2capConfig,
 }
 
 impl Default for CentralConfig {
@@ -38,6 +41,7 @@ impl Default for CentralConfig {
         Self {
             restore_identifier: None,
             connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
+            l2cap: L2capConfig::default(),
         }
     }
 }

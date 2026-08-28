@@ -83,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peripheral: Peripheral = Peripheral::with_config(PeripheralConfig {
         restore_identifier: Some(PERIPHERAL_RESTORE_ID.into()),
+        ..Default::default()
     })
     .await?;
 

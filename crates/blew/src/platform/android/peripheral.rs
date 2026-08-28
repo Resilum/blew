@@ -42,8 +42,10 @@ pub(crate) fn send_state_event(event: PeripheralStateEvent) {
 pub struct AndroidPeripheral;
 
 impl AndroidPeripheral {
-    pub async fn with_config(_config: PeripheralConfig) -> BlewResult<Self> {
-        <Self as PeripheralBackend>::new().await
+    pub async fn with_config(config: PeripheralConfig) -> BlewResult<Self> {
+        let this = <Self as PeripheralBackend>::new().await?;
+        super::l2cap_state::set_server_config(config.l2cap.clone());
+        Ok(this)
     }
 }
 

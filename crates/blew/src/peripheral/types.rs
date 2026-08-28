@@ -1,3 +1,4 @@
+use crate::l2cap::L2capConfig;
 use crate::types::DeviceId;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -15,6 +16,8 @@ pub struct PeripheralConfig {
     /// See the crate-level "State restoration" docs for the iOS usage contract
     /// (entitlements, event-drain rules, L2CAP re-open requirement).
     pub restore_identifier: Option<String>,
+    /// Tuning applied to L2CAP channels accepted by this peripheral.
+    pub l2cap: L2capConfig,
 }
 
 /// Non-request events from the peripheral role. Clone-able; multiple subscribers welcome.
