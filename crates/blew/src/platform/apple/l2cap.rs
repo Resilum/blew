@@ -26,6 +26,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
+use std::time::{Duration, Instant};
 
 use objc2::rc::autoreleasepool;
 use objc2_core_bluetooth::CBL2CAPChannel;
@@ -34,7 +35,7 @@ use objc2_foundation::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc as tokio_mpsc, oneshot};
+use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{debug, trace, warn};
 
 use crate::l2cap::types::{L2capCloseReason, L2capConfig};
@@ -69,7 +70,7 @@ struct RegisterChannel {
     outbound_rx: tokio_mpsc::Receiver<Vec<u8>>,
     read_chunk_size: usize,
     close_reason: CloseReasonSlot,
-    flushed: oneshot::Sender<()>,
+    linger_timeout: Option<Duration>,
 }
 
 enum ReactorCmd {
@@ -87,11 +88,38 @@ struct ReactorChannel {
     pending: VecDeque<Vec<u8>>,
     /// How much of `pending.front()` the stream has already taken.
     pending_offset: usize,
-    /// The app closed its write side; once `pending` empties we are flushed.
+    /// The app closed its write side; once `pending` empties we are drained.
     outbound_done: bool,
-    flushed: Option<oneshot::Sender<()>>,
+    /// Set when the app closed or dropped the channel. The reactor keeps
+    /// draining `pending` after this, which is what gives `Drop` the same
+    /// delivery behaviour as `close()`.
+    closing_since: Option<Instant>,
+    linger_timeout: Option<Duration>,
     read_chunk_size: usize,
     close_reason: CloseReasonSlot,
+}
+
+/// Whether a closing channel is finished: everything queued has been written,
+/// or the linger deadline has passed.
+///
+/// Split out from `ReactorChannel` so the policy is testable without a radio.
+fn linger_finished(
+    closing_since: Option<Instant>,
+    outbound_done: bool,
+    pending_empty: bool,
+    linger_timeout: Option<Duration>,
+    now: Instant,
+) -> bool {
+    let Some(since) = closing_since else {
+        return false;
+    };
+    if outbound_done && pending_empty {
+        return true;
+    }
+    match linger_timeout {
+        Some(limit) => now.duration_since(since) >= limit,
+        None => false,
+    }
 }
 
 struct L2capReactor {
@@ -128,7 +156,7 @@ enum Pump {
 
 impl ReactorChannel {
     /// Move bytes app -> peer, never writing without reported space.
-    fn pump_output(&mut self, id: u64) -> Pump {
+    fn pump_output(&mut self) -> Pump {
         loop {
             if self.pending.is_empty() {
                 match self.outbound_rx.try_recv() {
@@ -174,13 +202,6 @@ impl ReactorChannel {
             }
         }
 
-        if self.outbound_done
-            && self.pending.is_empty()
-            && let Some(flushed) = self.flushed.take()
-        {
-            trace!(id, "apple L2CAP outbound queue drained");
-            let _ = flushed.send(());
-        }
         Pump::Continue
     }
 
@@ -250,12 +271,6 @@ fn close_channel(
     }
     channel.input.close();
     channel.output.close();
-    // Unblock a `close()` that is still waiting on a flush that will now never
-    // complete; the timeout would cover it, but there is no reason to make the
-    // caller wait out a deadline for an already-dead channel.
-    if let Some(flushed) = channel.flushed {
-        let _ = flushed.send(());
-    }
     drop(channel.channel_ref);
 }
 
@@ -285,8 +300,15 @@ impl L2capReactor {
         while let Ok(cmd) = self.cmd_rx.try_recv() {
             match cmd {
                 ReactorCmd::Register(channel) => self.register_channel(run_loop, *channel),
+                // Closing is a request to stop *after* draining, not an
+                // immediate teardown -- see `pump_channels`.
                 ReactorCmd::Close { id } => {
-                    self.remove_channel(run_loop, id, &L2capCloseReason::Closed);
+                    if let Some(channel) = self.channels.get_mut(&id)
+                        && channel.closing_since.is_none()
+                    {
+                        channel.closing_since = Some(Instant::now());
+                        trace!(id, "apple L2CAP channel closing; draining outbound queue");
+                    }
                 }
             }
         }
@@ -302,7 +324,7 @@ impl L2capReactor {
             outbound_rx,
             read_chunk_size,
             close_reason,
-            flushed,
+            linger_timeout,
         } = channel;
 
         trace!(id, "apple L2CAP reactor registering channel");
@@ -323,7 +345,8 @@ impl L2capReactor {
                 pending: VecDeque::new(),
                 pending_offset: 0,
                 outbound_done: false,
-                flushed: Some(flushed),
+                closing_since: None,
+                linger_timeout,
                 read_chunk_size,
                 close_reason,
             },
@@ -331,14 +354,30 @@ impl L2capReactor {
     }
 
     fn pump_channels(&mut self, run_loop: &NSRunLoop) {
+        let now = Instant::now();
         let mut finished = Vec::new();
         for (&id, channel) in &mut self.channels {
-            if let Pump::Done(reason) = channel.pump_output(id) {
+            if let Pump::Done(reason) = channel.pump_output() {
                 finished.push((id, reason));
                 continue;
             }
-            if let Pump::Done(reason) = channel.pump_input(id) {
+            // A closing channel has no reader left, and its inbound queue has
+            // usually already been dropped -- which would otherwise look like a
+            // reason to tear down immediately and defeat the linger.
+            if channel.closing_since.is_none()
+                && let Pump::Done(reason) = channel.pump_input(id)
+            {
                 finished.push((id, reason));
+                continue;
+            }
+            if linger_finished(
+                channel.closing_since,
+                channel.outbound_done,
+                channel.pending.is_empty(),
+                channel.linger_timeout,
+                now,
+            ) {
+                finished.push((id, L2capCloseReason::Closed));
             }
         }
         for (id, reason) in finished {
@@ -394,7 +433,6 @@ pub(crate) fn bridge_l2cap_channel(
     let capacity = queue_capacity(config);
     let (inbound_tx, mut inbound_rx) = tokio_mpsc::channel::<Vec<u8>>(capacity);
     let (outbound_tx, outbound_rx) = tokio_mpsc::channel::<Vec<u8>>(capacity);
-    let (flushed_tx, flushed_rx) = oneshot::channel();
     let close_reason = CloseReasonSlot::default();
 
     let reactor = reactor_tx().clone();
@@ -410,7 +448,7 @@ pub(crate) fn bridge_l2cap_channel(
             outbound_rx,
             read_chunk_size: config.read_chunk_size.max(1),
             close_reason: close_reason.clone(),
-            flushed: flushed_tx,
+            linger_timeout: config.linger_timeout,
         })))
         .expect("apple L2CAP reactor available");
 
@@ -475,8 +513,6 @@ pub(crate) fn bridge_l2cap_channel(
             let _ = reactor.send(ReactorCmd::Close { id: channel_id });
         })),
         close_reason,
-        flushed: Some(flushed_rx),
-        flush_timeout: config.flush_timeout,
     }))
 }
 
@@ -502,6 +538,71 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(queue_capacity(&config), 2);
+    }
+
+    #[test]
+    fn not_closing_never_finishes() {
+        let now = Instant::now();
+        assert!(!linger_finished(None, true, true, None, now));
+    }
+
+    #[test]
+    fn closing_finishes_once_the_queue_is_drained() {
+        let now = Instant::now();
+        assert!(linger_finished(
+            Some(now),
+            true,
+            true,
+            Some(Duration::from_secs(60)),
+            now
+        ));
+    }
+
+    #[test]
+    fn closing_waits_while_bytes_remain() {
+        let now = Instant::now();
+        // Outbound finished but bytes still pending...
+        assert!(!linger_finished(
+            Some(now),
+            true,
+            false,
+            Some(Duration::from_secs(60)),
+            now
+        ));
+        // ...and the app may still be writing.
+        assert!(!linger_finished(
+            Some(now),
+            false,
+            true,
+            Some(Duration::from_secs(60)),
+            now
+        ));
+    }
+
+    #[test]
+    fn closing_gives_up_once_the_deadline_passes() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(2);
+        assert!(linger_finished(
+            Some(start),
+            false,
+            false,
+            Some(Duration::from_secs(1)),
+            later
+        ));
+    }
+
+    #[test]
+    fn a_none_deadline_drains_indefinitely() {
+        let start = Instant::now();
+        let much_later = start + Duration::from_secs(86_400);
+        assert!(!linger_finished(
+            Some(start),
+            false,
+            false,
+            None,
+            much_later
+        ));
     }
 
     #[test]

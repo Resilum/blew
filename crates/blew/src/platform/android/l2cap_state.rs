@@ -147,7 +147,6 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
             .lock()
             .insert(socket_id, close_reason.clone());
     }
-    let (flushed_tx, flushed_rx) = oneshot::channel();
 
     let handle = TOKIO_HANDLE.get().expect("tokio handle not initialized");
 
@@ -162,7 +161,6 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
     let is_server = from_server;
     handle.spawn(async move {
         let mut buf = vec![0_u8; read_chunk];
-        let mut flushed_tx = Some(flushed_tx);
         loop {
             match bridge_reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -189,23 +187,30 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
                 }
             }
         }
-        // Every byte handed to Kotlin has already been written to the socket --
-        // writeL2cap is synchronous -- so reaching here means the outbound
-        // queue is drained and a waiting `close()` can proceed.
-        if let Some(flushed) = flushed_tx.take() {
-            let _ = flushed.send(());
-        }
+        // writeL2cap is synchronous, so every byte handed to Kotlin is already
+        // on the socket: reaching here means the outbound side is drained.
+        // Closing from *here* rather than from the close hook is what makes a
+        // dropped channel finish writing instead of discarding, matching the
+        // Apple reactor's lingering close.
         close_socket(socket_id, is_server);
     });
 
+    let linger = config.linger_timeout;
     let channel = L2capChannel::from_bridge(DuplexBridge {
         inner: app_half,
         close_hook: Some(Box::new(move || {
-            close_socket(socket_id, from_server);
+            // The outbound task above closes the socket as soon as it drains.
+            // This only forces the issue if it never does -- a peer that has
+            // stopped accepting data must not pin the socket open forever.
+            let Some(limit) = linger else { return };
+            if let Some(handle) = TOKIO_HANDLE.get() {
+                handle.spawn(async move {
+                    tokio::time::sleep(limit).await;
+                    close_socket(socket_id, from_server);
+                });
+            }
         })),
         close_reason,
-        flushed: Some(flushed_rx),
-        flush_timeout: config.flush_timeout,
     });
 
     if from_server {

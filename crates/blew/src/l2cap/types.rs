@@ -27,8 +27,8 @@ impl std::fmt::Display for Psm {
 pub const DEFAULT_L2CAP_BUFFER_SIZE: usize = 64 * 1024;
 /// Default for [`L2capConfig::read_chunk_size`].
 pub const DEFAULT_L2CAP_READ_CHUNK_SIZE: usize = 4096;
-/// Default for [`L2capConfig::flush_timeout`].
-pub const DEFAULT_L2CAP_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+/// Default for [`L2capConfig::linger_timeout`].
+pub const DEFAULT_L2CAP_LINGER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Tuning for a single L2CAP channel.
 ///
@@ -59,12 +59,22 @@ pub struct L2capConfig {
     pub buffer_size: usize,
     /// Largest read issued against the platform socket at once.
     pub read_chunk_size: usize,
-    /// How long [`L2capChannel::close`](crate::L2capChannel::close) waits for
-    /// queued outbound bytes to reach the peer before tearing the channel down.
+    /// How long the backend keeps a closing channel alive to finish writing
+    /// whatever is still queued, before tearing it down regardless.
     ///
-    /// `None` waits indefinitely. Dropping a channel never waits — only an
-    /// explicit `close()` can, since `Drop` cannot await.
-    pub flush_timeout: Option<Duration>,
+    /// Modelled on `SO_LINGER`. Closing is asynchronous: both
+    /// [`L2capChannel::close`](crate::L2capChannel::close) and dropping the
+    /// channel hand it to the backend, which keeps draining until the queue
+    /// empties or this deadline passes. Neither blocks the caller, so `Drop`
+    /// gets the same delivery guarantee `close()` does — which matters, because
+    /// dropping is by far the more common way an `AsyncWrite` goes away.
+    ///
+    /// `None` drains indefinitely and never forces teardown; use it only when
+    /// the peer is trusted to keep accepting data.
+    ///
+    /// Note this is delivery to the *platform socket*, not acknowledgement by
+    /// the peer. Nothing here waits for the far end to read.
+    pub linger_timeout: Option<Duration>,
 }
 
 impl Default for L2capConfig {
@@ -72,7 +82,7 @@ impl Default for L2capConfig {
         Self {
             buffer_size: DEFAULT_L2CAP_BUFFER_SIZE,
             read_chunk_size: DEFAULT_L2CAP_READ_CHUNK_SIZE,
-            flush_timeout: Some(DEFAULT_L2CAP_FLUSH_TIMEOUT),
+            linger_timeout: Some(DEFAULT_L2CAP_LINGER_TIMEOUT),
         }
     }
 }

@@ -8,7 +8,7 @@ All notable changes to `blew` are documented here. Format follows
 ### Added
 
 - **`L2capConfig`**, on `CentralConfig::l2cap` and `PeripheralConfig::l2cap`:
-  `buffer_size`, `read_chunk_size` and `flush_timeout`. Linux observes none of
+  `buffer_size`, `read_chunk_size` and `linger_timeout`. Linux observes none of
   them — `bluer::l2cap::Stream` is already an async byte stream handed straight
   to the caller, so there is no in-process bridge to size and nothing queued
   locally to flush. Apple and Android observe all three.
@@ -21,12 +21,19 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Changed
 
-- **`L2capChannel::close()` flushes before tearing down.** It shuts the write
-  side, waits up to `L2capConfig::flush_timeout` (default 1s) for the backend
-  to report its outbound queue drained, then closes. A timeout is not an error
-  — the channel closes regardless, since the alternative is hanging on a peer
-  that has stopped granting credits. Dropping a channel still tears down
-  immediately and discards anything queued, because `Drop` cannot await.
+- **Closing an L2CAP channel now lingers instead of discarding.** Both
+  `close()` and dropping the channel hand it to the backend, which keeps
+  writing whatever is still queued until the queue empties or
+  `L2capConfig::linger_timeout` (default 1s) passes — `SO_LINGER` semantics.
+  Previously the queued bytes were dropped on the floor.
+
+  Neither path blocks the caller, and neither has a delivery advantage over
+  the other. That symmetry is the point: an `AsyncWrite` that only kept your
+  data when you remembered to close it explicitly would be a trap, and
+  dropping is by far the more common way one of these goes away.
+
+  What this does *not* promise is peer acknowledgement — lingering covers
+  delivery to the platform socket, nothing beyond it.
 - **Breaking: `Peripheral::l2cap_listener` and `Central::open_l2cap_channel`
   now report an unusable channel as an error.** Apple previously logged a
   warning and returned a channel whose peer half had already been dropped, so

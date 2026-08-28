@@ -6,11 +6,9 @@ use std::future::poll_fn;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
-use tokio::sync::oneshot;
 
 type CloseHook = Box<dyn FnOnce() + Send + 'static>;
 type DynTransport = dyn L2capTransport;
@@ -54,18 +52,6 @@ trait L2capTransport: Send {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>>;
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>>;
-
-    /// Receiver signalled by the backend once every queued outbound byte has
-    /// reached the platform socket. `None` when the transport queues nothing
-    /// locally, which is the case for a native async socket.
-    fn take_flush_signal(self: Pin<&mut Self>) -> Option<oneshot::Receiver<()>> {
-        None
-    }
-
-    /// How long `close()` should wait on [`take_flush_signal`](Self::take_flush_signal).
-    fn flush_timeout(&self) -> Option<Duration> {
-        None
-    }
 
     /// Why the channel ended, if the backend recorded a reason.
     fn close_reason(&self) -> Option<L2capCloseReason> {
@@ -123,17 +109,12 @@ pub(crate) struct DuplexBridge {
     pub(crate) inner: DuplexStream,
     pub(crate) close_hook: Option<CloseHook>,
     pub(crate) close_reason: CloseReasonSlot,
-    /// Signalled by the backend's outbound task once its queue has drained.
-    pub(crate) flushed: Option<oneshot::Receiver<()>>,
-    pub(crate) flush_timeout: Option<Duration>,
 }
 
 struct DuplexTransport {
     inner: DuplexStream,
     close_hook: Option<CloseHook>,
     close_reason: CloseReasonSlot,
-    flushed: Option<oneshot::Receiver<()>>,
-    flush_timeout: Option<Duration>,
 }
 
 impl DuplexTransport {
@@ -142,8 +123,6 @@ impl DuplexTransport {
             inner: bridge.inner,
             close_hook: bridge.close_hook,
             close_reason: bridge.close_reason,
-            flushed: bridge.flushed,
-            flush_timeout: bridge.flush_timeout,
         }
     }
 
@@ -203,14 +182,6 @@ impl L2capTransport for DuplexTransport {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 
-    fn take_flush_signal(mut self: Pin<&mut Self>) -> Option<oneshot::Receiver<()>> {
-        self.flushed.take()
-    }
-
-    fn flush_timeout(&self) -> Option<Duration> {
-        self.flush_timeout
-    }
-
     fn close_reason(&self) -> Option<L2capCloseReason> {
         self.close_reason.get()
     }
@@ -248,38 +219,23 @@ impl L2capChannel {
         self.inner.close_reason()
     }
 
-    /// Close the channel, giving queued outbound bytes a chance to reach the
-    /// peer first.
+    /// Close the channel.
     ///
-    /// Shuts down the write side, waits up to
-    /// [`L2capConfig::flush_timeout`] for the backend to report its outbound
-    /// queue drained, then tears the transport down. A timeout is not an error:
-    /// the channel closes regardless, since the alternative is hanging on a
-    /// peer that has stopped granting L2CAP credits.
+    /// Shuts down the write side and hands the channel to the backend, which
+    /// keeps draining whatever is still queued until it empties or
+    /// [`L2capConfig::linger_timeout`] passes. This does not block on that
+    /// drain, so it does not hang on a peer that has stopped granting L2CAP
+    /// credits.
     ///
-    /// Dropping a channel instead of calling this skips the flush entirely --
-    /// `Drop` cannot await. Anything still queued is discarded.
+    /// Dropping the channel does exactly the same thing. There is deliberately
+    /// no delivery advantage to calling this — an `AsyncWrite` that only kept
+    /// its data when you remembered to close it explicitly would be a trap.
+    /// What `close()` gives you is the `io::Result` from shutting down the
+    /// write side.
     pub async fn close(&mut self) -> std::io::Result<()> {
-        // Half-close first: the backend's outbound task sees EOF and knows the
-        // queue it is draining is the last of it.
+        // Half-close first: this is what tells the backend's outbound task that
+        // the bytes it still holds are the last of them.
         poll_fn(|cx| self.inner.as_mut().poll_shutdown(cx)).await?;
-
-        if let Some(flushed) = self.inner.as_mut().take_flush_signal() {
-            match self.inner.flush_timeout() {
-                Some(limit) => {
-                    if tokio::time::timeout(limit, flushed).await.is_err() {
-                        tracing::debug!(
-                            ?limit,
-                            "L2CAP close timed out flushing outbound queue; closing anyway"
-                        );
-                    }
-                }
-                None => {
-                    let _ = flushed.await;
-                }
-            }
-        }
-
         poll_fn(|cx| self.inner.as_mut().poll_close(cx)).await
     }
 
@@ -298,8 +254,6 @@ impl L2capChannel {
             inner,
             close_hook: None,
             close_reason: CloseReasonSlot::default(),
-            flushed: None,
-            flush_timeout: None,
         })
     }
 
@@ -355,16 +309,12 @@ mod tests {
     fn bridged(
         inner: DuplexStream,
         close_hook: Option<CloseHook>,
-        flushed: Option<oneshot::Receiver<()>>,
-        flush_timeout: Option<Duration>,
     ) -> (L2capChannel, CloseReasonSlot) {
         let close_reason = CloseReasonSlot::default();
         let channel = L2capChannel::from_bridge(DuplexBridge {
             inner,
             close_hook,
             close_reason: close_reason.clone(),
-            flushed,
-            flush_timeout,
         });
         (channel, close_reason)
     }
@@ -422,7 +372,7 @@ mod tests {
                 counter.fetch_add(1, Ordering::SeqCst);
             }) as CloseHook
         };
-        let (mut channel, _) = bridged(inner, Some(hook), None, None);
+        let (mut channel, _) = bridged(inner, Some(hook));
 
         channel.close().await.unwrap();
         channel.close().await.unwrap();
@@ -441,7 +391,7 @@ mod tests {
                 counter.fetch_add(1, Ordering::SeqCst);
             }) as CloseHook
         };
-        let (channel, _) = bridged(inner, Some(hook), None, None);
+        let (channel, _) = bridged(inner, Some(hook));
 
         drop(channel);
 
@@ -451,7 +401,7 @@ mod tests {
     #[tokio::test]
     async fn clean_close_reads_as_eof() {
         let (inner, peer) = tokio::io::duplex(1024);
-        let (mut channel, reason) = bridged(inner, None, None, None);
+        let (mut channel, reason) = bridged(inner, None);
         reason.set(L2capCloseReason::Closed);
         drop(peer);
 
@@ -463,7 +413,7 @@ mod tests {
     #[tokio::test]
     async fn link_loss_reads_as_error_not_eof() {
         let (inner, peer) = tokio::io::duplex(1024);
-        let (mut channel, reason) = bridged(inner, None, None, None);
+        let (mut channel, reason) = bridged(inner, None);
         reason.set(L2capCloseReason::LinkLost);
         drop(peer);
 
@@ -479,7 +429,7 @@ mod tests {
     #[tokio::test]
     async fn transport_error_reads_as_error() {
         let (inner, peer) = tokio::io::duplex(1024);
-        let (mut channel, reason) = bridged(inner, None, None, None);
+        let (mut channel, reason) = bridged(inner, None);
         reason.set(L2capCloseReason::TransportError("stream died".into()));
         drop(peer);
 
@@ -496,7 +446,7 @@ mod tests {
         // A recorded failure must not swallow bytes already in the buffer --
         // only the EOF that follows them becomes an error.
         let (inner, mut peer) = tokio::io::duplex(1024);
-        let (mut channel, reason) = bridged(inner, None, None, None);
+        let (mut channel, reason) = bridged(inner, None);
         peer.write_all(b"tail").await.unwrap();
         reason.set(L2capCloseReason::LinkLost);
         drop(peer);
@@ -508,46 +458,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_waits_for_the_flush_signal() {
-        let (inner, _peer) = tokio::io::duplex(1024);
-        let (tx, rx) = oneshot::channel();
-        let (mut channel, _) = bridged(inner, None, Some(rx), Some(Duration::from_secs(30)));
-
-        let flushed = Arc::new(AtomicUsize::new(0));
-        let flushed_marker = Arc::clone(&flushed);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            flushed_marker.store(1, Ordering::SeqCst);
-            let _ = tx.send(());
-        });
+    async fn close_shuts_down_the_write_side_before_firing_the_hook() {
+        // The backend's linger depends on this ordering: half-closing is what
+        // tells its outbound task that the bytes it holds are the last ones, so
+        // the hook must not arrive first.
+        let (inner, mut peer) = tokio::io::duplex(1024);
+        let saw_eof = Arc::new(AtomicUsize::new(0));
+        let marker = Arc::clone(&saw_eof);
+        let hook = Box::new(move || {
+            marker.store(1, Ordering::SeqCst);
+        }) as CloseHook;
+        let (mut channel, _) = bridged(inner, Some(hook));
 
         channel.close().await.unwrap();
-        assert_eq!(
-            flushed.load(Ordering::SeqCst),
-            1,
-            "close returned before the outbound queue drained"
-        );
+
+        // Peer sees EOF, and the hook ran.
+        let n = peer.read(&mut [0_u8; 1]).await.unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(saw_eof.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn close_gives_up_on_the_flush_signal_after_the_timeout() {
+    async fn close_does_not_block_on_a_peer_that_never_drains() {
         let (inner, _peer) = tokio::io::duplex(1024);
-        // Sender is held, so the signal never arrives.
-        let (_tx, rx) = oneshot::channel();
-        let (mut channel, _) = bridged(inner, None, Some(rx), Some(Duration::from_millis(50)));
-
-        timeout(Duration::from_secs(5), channel.close())
+        let (mut channel, _) = bridged(inner, None);
+        timeout(Duration::from_millis(500), channel.close())
             .await
-            .expect("close must not hang on a peer that never drains")
+            .expect("close must not wait on the backend")
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn drop_does_not_wait_to_flush() {
-        let (inner, _peer) = tokio::io::duplex(1024);
-        let (_tx, rx) = oneshot::channel();
-        let (channel, _) = bridged(inner, None, Some(rx), None);
-        // `None` timeout would wait forever in close(); Drop must not.
-        drop(channel);
     }
 }
