@@ -5,6 +5,21 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `Central::refresh` on non-Android targets is now declared as
+  `fn refresh(..) -> impl Future<Output = BlewResult<()>> + Send` instead of
+  `async fn`. Callers that `.await` it are unaffected; the change silences a
+  new `clippy::unused_async_trait_impl` error that broke the CI lint gate.
+
+### Fixed
+
+- Refreshed `Cargo.lock`, pulling in `plist 1.10.0` / `quick-xml 0.41.0` and
+  clearing RUSTSEC-2026-0194 and RUSTSEC-2026-0195, which were failing
+  `cargo deny`. Both advisories reached the tree through `tauri`'s build-time
+  `Info.plist` parsing and did not affect `blew` itself. `tauri` also moves
+  2.11.0 → 2.11.5 and `tauri-build` / `tauri-plugin` 2.6.0 → 2.6.3.
+
 ## [0.3.0] — 2026-04-22
 
 ### Added

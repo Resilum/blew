@@ -176,9 +176,11 @@ impl<B: CentralBackend> Central<B> {
     /// Android-only. On other platforms this returns
     /// [`BlewError::NotSupported`].
     #[cfg(not(target_os = "android"))]
-    #[allow(clippy::unused_async)]
-    pub async fn refresh(&self, _device_id: &DeviceId) -> BlewResult<()> {
-        Err(BlewError::NotSupported)
+    pub fn refresh(
+        &self,
+        _device_id: &DeviceId,
+    ) -> impl std::future::Future<Output = BlewResult<()>> + Send {
+        std::future::ready(Err(BlewError::NotSupported))
     }
 
     /// Wait until the adapter is powered on, or return `BlewError::Timeout`.
