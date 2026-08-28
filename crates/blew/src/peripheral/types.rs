@@ -52,6 +52,13 @@ pub enum PeripheralRequest {
         client_id: DeviceId,
         service_uuid: Uuid,
         char_uuid: Uuid,
+        /// Byte offset into the characteristic value at which `value` starts.
+        ///
+        /// Zero for an ordinary write. A central writing a payload larger than
+        /// `MTU - 3` splits it across several requests with ascending offsets,
+        /// so an application reassembling long writes must splice `value` in at
+        /// `offset` rather than treating each request as a whole value.
+        offset: u16,
         value: Vec<u8>,
         responder: Option<WriteResponder>,
     },

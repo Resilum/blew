@@ -95,6 +95,7 @@ object BlePeripheralManager {
         deviceAddr: String,
         serviceUuid: String,
         charUuid: String,
+        offset: Int,
         value: ByteArray,
         responseNeeded: Boolean,
     )
@@ -255,6 +256,7 @@ object BlePeripheralManager {
                     device.address,
                     characteristic.service.uuid.toString(),
                     characteristic.uuid.toString(),
+                    offset,
                     value ?: ByteArray(0),
                     responseNeeded,
                 )

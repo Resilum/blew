@@ -447,6 +447,7 @@ impl CentralBackend for MockCentral {
                 client_id: DeviceId::from("mock-central"),
                 service_uuid: Uuid::nil(),
                 char_uuid,
+                offset: 0,
                 value,
                 responder,
             });

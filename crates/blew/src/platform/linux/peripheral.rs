@@ -148,6 +148,7 @@ fn build_characteristic(
                                 client_id,
                                 service_uuid: svc_uuid,
                                 char_uuid: uuid,
+                                offset: req.offset,
                                 value,
                                 responder,
                             },

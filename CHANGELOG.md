@@ -5,6 +5,18 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: `PeripheralRequest::Write` gains an `offset: u16` field**,
+  matching the one `PeripheralRequest::Read` already carried. Without it an
+  application had no way to reassemble a long write — every backend received
+  the offset from the OS and discarded it at the Rust boundary. See the
+  upgrade guide below.
+- `Central::refresh` on non-Android targets is now declared as
+  `fn refresh(..) -> impl Future<Output = BlewResult<()>> + Send` instead of
+  `async fn`. Callers that `.await` it are unaffected; the change silences a
+  new `clippy::unused_async_trait_impl` error that broke the CI lint gate.
+
 ### Fixed
 
 - **Apple: GATT operations no longer hang forever when the peer disconnects.**
@@ -19,16 +31,14 @@ All notable changes to `blew` are documented here. Format follows
   the pending entry for the life of the process. Android already handled
   this via its per-operation queue timeout; Linux surfaces bluer's D-Bus
   errors.
-
-### Changed
-
-- `Central::refresh` on non-Android targets is now declared as
-  `fn refresh(..) -> impl Future<Output = BlewResult<()>> + Send` instead of
-  `async fn`. Callers that `.await` it are unaffected; the change silences a
-  new `clippy::unused_async_trait_impl` error that broke the CI lint gate.
-
-### Fixed
-
+- **Apple: long and batched ATT writes no longer lose all but their first
+  fragment.** `peripheralManager:didReceiveWriteRequests:` took
+  `requests[0]` and dropped the rest of the array. CoreBluetooth batches
+  queued and prepared (long) writes into that array: exactly one ATT
+  response is owed and it must name the first request, but *every* request
+  carries its own slice of the payload. All fragments are now emitted as
+  separate `PeripheralRequest::Write` events and the batch is acknowledged
+  only once all of them have been answered.
 - Refreshed `Cargo.lock`, pulling in `plist 1.10.0` / `quick-xml 0.41.0` and
   clearing RUSTSEC-2026-0194 and RUSTSEC-2026-0195, which were failing
   `cargo deny`. Both advisories reached the tree through `tauri`'s build-time
@@ -323,6 +333,36 @@ on Apple and Android. If you need shared-completion fan-out semantics,
 implement them at your layer (e.g. wrap the shared future in
 `futures::future::Shared`). Linux still permits concurrent connects via
 bluer's own state machine.
+
+---
+
+## Upgrade guide — 0.3.x → Unreleased
+
+**If you were matching on `PeripheralRequest::Write`**, it gains an `offset`
+field. Bindings that already end in `..` need no change; exhaustive patterns
+do:
+
+```rust
+// Before
+PeripheralRequest::Write { client_id, char_uuid, value, responder, .. } => {
+    store.insert(char_uuid, value);
+    if let Some(r) = responder { r.success(); }
+}
+
+// After — splice at the offset instead of replacing the whole value
+PeripheralRequest::Write { client_id, char_uuid, offset, value, responder, .. } => {
+    let buf = store.entry(char_uuid).or_default();
+    let start = offset as usize;
+    if buf.len() < start + value.len() {
+        buf.resize(start + value.len(), 0);
+    }
+    buf[start..start + value.len()].copy_from_slice(&value);
+    if let Some(r) = responder { r.success(); }
+}
+```
+
+`offset` is `0` for ordinary writes, so applications that never receive a
+payload larger than `MTU - 3` can keep treating `value` as the whole value.
 
 ---
 

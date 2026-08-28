@@ -405,51 +405,78 @@ define_class!(
         ) {
             let inner = self.ivars();
 
-            if requests.count() == 0 {
+            let count = requests.count();
+            if count == 0 {
                 return;
             }
-            let request = requests.objectAtIndex(0);
+            // CoreBluetooth batches queued and long (prepared) writes into this
+            // array. Exactly one ATT response is owed, and it must name the
+            // *first* request -- but every request in the batch carries its own
+            // slice of the payload and all of them must be delivered, or a long
+            // write silently loses everything past the first fragment.
+            let first = requests.objectAtIndex(0);
 
-            let req_char = request.characteristic();
-            let req_char_uuid = req_char.UUID();
-            let Some(char_uuid) = cbuuid_to_uuid(&req_char_uuid) else {
-                peripheral.respondToRequest_withResult(&request, CBATTError::AttributeNotFound);
-                return;
-            };
+            let mut waiters = Vec::with_capacity(count);
+            for i in 0..count {
+                let request = requests.objectAtIndex(i);
+                let req_char = request.characteristic();
+                let req_char_uuid = req_char.UUID();
+                let Some(char_uuid) = cbuuid_to_uuid(&req_char_uuid) else {
+                    // One unmappable characteristic invalidates the batch: the
+                    // fragments are not independently applicable.
+                    peripheral.respondToRequest_withResult(&first, CBATTError::AttributeNotFound);
+                    return;
+                };
 
-            let service_uuid = req_char
-                .service()
-                .and_then(|s| { let u = s.UUID(); cbuuid_to_uuid(&u) })
-                .unwrap_or(Uuid::nil());
+                let service_uuid = req_char
+                    .service()
+                    .and_then(|s| { let u = s.UUID(); cbuuid_to_uuid(&u) })
+                    .unwrap_or(Uuid::nil());
 
-            let req_central = request.central();
-            let client_id = central_device_id(&req_central);
-            let value = request.value().map(|d| d.to_vec()).unwrap_or_default();
+                let req_central = request.central();
+                let client_id = central_device_id(&req_central);
+                let offset = request.offset() as u16;
+                let value = request.value().map(|d| d.to_vec()).unwrap_or_default();
 
-            trace!(client_id = %client_id, %char_uuid, len = value.len(), "ATT write request");
+                trace!(
+                    client_id = %client_id,
+                    %char_uuid,
+                    offset,
+                    len = value.len(),
+                    fragment = i,
+                    "ATT write request"
+                );
 
-            let (tx, rx) = oneshot::channel::<bool>();
-            let responder = WriteResponder::new(tx);
+                let (tx, rx) = oneshot::channel::<bool>();
+                waiters.push(rx);
 
-            inner.emit_request(PeripheralRequest::Write {
-                client_id,
-                service_uuid,
-                char_uuid,
-                value,
-                responder: Some(responder),
-            });
+                inner.emit_request(PeripheralRequest::Write {
+                    client_id,
+                    service_uuid,
+                    char_uuid,
+                    offset,
+                    value,
+                    responder: Some(WriteResponder::new(tx)),
+                });
+            }
 
-            let request_retained = unsafe { retain_send(&*request) };
+            let first_retained = unsafe { retain_send(&*first) };
             let manager_retained = unsafe { retain_send(peripheral) };
             inner.runtime.spawn(async move {
-                let success = rx.await.unwrap_or(false);
+                // Await every fragment before responding -- short-circuiting
+                // would drop the remaining receivers and strand the app's
+                // responders. The batch succeeds only if all fragments do.
+                let mut success = true;
+                for rx in waiters {
+                    success &= rx.await.unwrap_or(false);
+                }
                 let result = if success {
                     CBATTError::Success
                 } else {
                     CBATTError::WriteNotPermitted
                 };
                 unsafe {
-                    manager_retained.respondToRequest_withResult(&request_retained, result);
+                    manager_retained.respondToRequest_withResult(&first_retained, result);
                 };
             });
         }

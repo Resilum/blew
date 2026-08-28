@@ -158,6 +158,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnWrit
     device_addr: JString,
     service_uuid: JString,
     char_uuid: JString,
+    offset: jint,
     value: JByteArray,
     response_needed: jboolean,
 ) {
@@ -198,6 +199,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnWrit
                 client_id: DeviceId::from(addr.as_str()),
                 service_uuid: svc_uuid,
                 char_uuid: char_id,
+                offset: offset as u16,
                 value: data,
                 responder,
             };
