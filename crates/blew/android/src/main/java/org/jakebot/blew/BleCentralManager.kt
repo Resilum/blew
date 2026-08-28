@@ -762,7 +762,9 @@ object BleCentralManager {
                 return
             }
 
-        Thread {
+        // connect() and the read loop are both blocking; they belong on the IO
+        // dispatcher rather than on a raw thread per channel.
+        scope.launch(Dispatchers.IO) {
             try {
                 val socket = device.createInsecureL2capChannel(psm)
                 socket.connect()
@@ -773,7 +775,7 @@ object BleCentralManager {
                 Log.e(TAG, "L2CAP connect failed: ${e.message}")
                 nativeOnL2capChannelError(deviceAddr, e.message ?: "connect failed")
             }
-        }.start()
+        }
     }
 
     @JvmStatic

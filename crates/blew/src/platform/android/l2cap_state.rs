@@ -166,32 +166,47 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let data = buf[..n].to_vec();
-                    let result = jvm().attach_current_thread(|env| {
-                        let j_data = env.byte_array_from_slice(&data)?;
-                        let class = if is_server {
-                            peripheral_class()
-                        } else {
-                            central_class()
-                        };
-                        env.call_static_method(
-                            class,
-                            jni_str!("writeL2cap"),
-                            jni_sig!("(I[B)V"),
-                            &[socket_id.into(), (&j_data).into()],
-                        )?;
-                        Ok::<_, jni::errors::Error>(())
-                    });
-                    if result.is_err() {
+                    // Kotlin's writeL2cap goes straight to a blocking
+                    // BluetoothSocket OutputStream -- Android exposes no async
+                    // socket API at any level -- so it must not run on a Tokio
+                    // worker. Under the current-thread runtime the examples use
+                    // it would stall the whole runtime; under a multi-threaded
+                    // one it burns a worker per writing channel.
+                    //
+                    // Awaiting the blocking task rather than firing and
+                    // forgetting is load-bearing twice over: it preserves
+                    // backpressure into the caller's `write()`, and it keeps
+                    // "this task has exited" equivalent to "the bytes are on
+                    // the socket", which the lingering close below relies on.
+                    let result = tokio::task::spawn_blocking(move || {
+                        jvm().attach_current_thread(|env| {
+                            let j_data = env.byte_array_from_slice(&data)?;
+                            let class = if is_server {
+                                peripheral_class()
+                            } else {
+                                central_class()
+                            };
+                            env.call_static_method(
+                                class,
+                                jni_str!("writeL2cap"),
+                                jni_sig!("(I[B)V"),
+                                &[socket_id.into(), (&j_data).into()],
+                            )?;
+                            Ok::<_, jni::errors::Error>(())
+                        })
+                    })
+                    .await;
+                    if !matches!(result, Ok(Ok(()))) {
                         break;
                     }
                 }
             }
         }
-        // writeL2cap is synchronous, so every byte handed to Kotlin is already
-        // on the socket: reaching here means the outbound side is drained.
-        // Closing from *here* rather than from the close hook is what makes a
-        // dropped channel finish writing instead of discarding, matching the
-        // Apple reactor's lingering close.
+        // Every write above completed before its `await` returned, so reaching
+        // here means the outbound side is drained. Closing from *here* rather
+        // than from the close hook is what makes a dropped channel finish
+        // writing instead of discarding, matching the Apple reactor's
+        // lingering close.
         close_socket(socket_id, is_server);
     });
 

@@ -88,6 +88,25 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Fixed
 
+- **Android: L2CAP writes no longer block a Tokio worker.** The outbound task
+  called Kotlin's `writeL2cap` — which lands on a blocking `BluetoothSocket`
+  `OutputStream` — directly from an async task. Under the current-thread
+  runtime the examples use, a slow peer stalled the entire runtime; under a
+  multi-threaded one it burned a worker per writing channel. The call now goes
+  through `spawn_blocking`. It is still awaited, which preserves both
+  backpressure into the caller's `write()` and the lingering close's
+  assumption that a finished outbound task means the bytes are on the socket.
+
+- **Android: concurrent writes to one L2CAP socket can no longer interleave.**
+  `L2capSocketManager.write` took no lock, so two writers could splice partial
+  payloads into the same stream. Each socket now has its own monitor.
+
+- **Android: blocking L2CAP loops moved off raw threads.** Channel connect,
+  server accept, and per-socket reads each spawned an unmanaged `Thread`. They
+  now run on a `Dispatchers.IO` scope. `BluetoothSocket` exposes no async API,
+  so a blocking read per channel remains unavoidable — but it no longer costs
+  an unmanaged thread apiece.
+
 - **L2CAP no longer buffers without limit in either direction.** Every queue
   between the application and the platform socket on Apple and Android was
   unbounded: the Apple reactor's command channel and inbound channel, and

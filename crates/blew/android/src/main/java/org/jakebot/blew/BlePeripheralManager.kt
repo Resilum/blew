@@ -13,6 +13,10 @@ import android.content.IntentFilter
 import android.os.Build
 import android.os.ParcelUuid
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -30,6 +34,14 @@ object BlePeripheralManager {
 
     private var context: Context? = null
     private var bluetoothManager: BluetoothManager? = null
+
+    /**
+     * Hosts the blocking L2CAP accept loop. `BluetoothServerSocket.accept()`
+     * has no async form, so it has to block something; a managed dispatcher is
+     * a better host for that than a raw thread.
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     private var gattServer: BluetoothGattServer? = null
     private var advertiser: BluetoothLeAdvertiser? = null
 
@@ -560,20 +572,22 @@ object BlePeripheralManager {
             val psm = serverSocket.psm
             nativeOnL2capServerOpened(psm)
 
-            Thread {
+            // accept() blocks, and so does each accepted socket's read loop;
+            // both belong on the IO dispatcher rather than on raw threads.
+            scope.launch(Dispatchers.IO) {
                 while (true) {
                     try {
                         val socket = serverSocket.accept()
                         val addr = socket.remoteDevice.address
                         val socketId = l2cap.register(socket)
                         nativeOnL2capChannelOpened(addr, socketId, true)
-                        Thread { l2cap.startReadLoop(socketId, addr, socket) }.start()
+                        l2cap.startReadLoopAsync(socketId, addr, socket)
                     } catch (e: Exception) {
                         Log.d(TAG, "L2CAP accept ended: ${e.message}")
                         break
                     }
                 }
-            }.start()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "L2CAP server failed: ${e.message}")
             nativeOnL2capServerError(e.message ?: "server open failed")
