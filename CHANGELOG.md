@@ -19,6 +19,17 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Fixed
 
+- **Linux: spontaneous disconnects are now reported.** `DeviceDisconnected`
+  was only emitted on an explicit `disconnect()`, a connect timeout, or a
+  BlueZ `DeviceRemoved` — and `DeviceRemoved` only arrives while a discovery
+  session is running. Connecting, calling `stop_scan`, and then walking out
+  of range produced no event at all, so applications driving reconnection
+  from the event stream would wait forever. Each connection now gets a
+  `Connected` property watcher, which bluer surfaces over D-Bus independently
+  of discovery. Disconnect reporting is deduplicated across all three
+  observers, so an explicit `disconnect()` on a device that was never
+  connected through `Central::connect` no longer emits a spurious event.
+
 - **Linux: starting a scan no longer deletes the user's bonded devices.**
   `start_scan` cleared BlueZ's stale device cache by calling
   `Adapter::remove_device` on every cached address that was not currently

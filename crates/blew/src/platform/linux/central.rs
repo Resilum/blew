@@ -8,9 +8,9 @@ use crate::platform::linux::l2cap::bridge_l2cap;
 use crate::types::{BleDevice, DeviceId};
 use crate::util::BroadcastEventStream;
 use bluer::gatt::CharacteristicFlags;
-use bluer::{Adapter, AdapterEvent, Session};
+use bluer::{Adapter, AdapterEvent, Device, DeviceEvent, DeviceProperty, Session};
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -28,6 +28,16 @@ struct CentralInner {
     event_tx: broadcast::Sender<CentralEvent>,
     scan_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     notify_tasks: Mutex<HashMap<(DeviceId, Uuid), tokio::task::JoinHandle<()>>>,
+    /// Per-device `Connected` property watchers. BlueZ only reports
+    /// `DeviceRemoved` while a discovery session is live, so without these a
+    /// peer that drops out of range after `stop_scan` is never observed.
+    connection_tasks: Mutex<HashMap<DeviceId, tokio::task::JoinHandle<()>>>,
+    /// Devices with a live connection. Link-down can be observed from three
+    /// places (explicit `disconnect`, BlueZ `DeviceRemoved`, and the
+    /// `Connected` watcher); membership here makes `DeviceDisconnected`
+    /// exactly-once. The connect-timeout path reports its own failure
+    /// directly and is deliberately not routed through this.
+    connected: Mutex<HashSet<DeviceId>>,
     adapter_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     connect_timeout: Mutex<Option<std::time::Duration>>,
     pending_connects: crate::util::request_map::KeyedRequestMap<DeviceId, ()>,
@@ -67,10 +77,46 @@ async fn connect_inner(handle: Arc<CentralInner>, device_id: DeviceId) -> BlewRe
     }
     debug!(device_id = %device_id, "device connected");
     handle.clear_mtu(&device_id);
+    handle.connected.lock().insert(device_id.clone());
+    // Clone rather than move: `connect_fut` above borrows `device`, and
+    // `bluer::Device` is a cheap D-Bus proxy handle.
+    spawn_connection_watcher(&handle, device_id.clone(), device.clone());
     let _ = handle
         .event_tx
         .send(CentralEvent::DeviceConnected { device_id });
     Ok(())
+}
+
+/// Watch a connected device's `Connected` property and report link loss.
+///
+/// bluer surfaces this over D-Bus independently of any discovery session, so
+/// unlike `AdapterEvent::DeviceRemoved` it still fires after `stop_scan`.
+fn spawn_connection_watcher(handle: &Arc<CentralInner>, device_id: DeviceId, device: Device) {
+    let inner = Arc::clone(handle);
+    let watched = device_id.clone();
+    let task = tokio::spawn(async move {
+        let events = match device.events().await {
+            Ok(events) => events,
+            Err(e) => {
+                warn!(device_id = %watched, "failed to watch connection state: {e}");
+                return;
+            }
+        };
+        let mut events = Box::pin(events);
+        while let Some(event) = events.next().await {
+            if let DeviceEvent::PropertyChanged(DeviceProperty::Connected(false)) = event {
+                let cause = inner.involuntary_cause().await;
+                debug!(device_id = %watched, ?cause, "connection watcher observed link down");
+                inner.emit_disconnect(&watched, cause);
+                return;
+            }
+        }
+    });
+    // Replacing a watcher for the same device means a reconnect raced an old
+    // link; the stale task is aborted rather than left to double-report.
+    if let Some(old) = handle.connection_tasks.lock().insert(device_id, task) {
+        old.abort();
+    }
 }
 
 impl LinuxCentral {
@@ -102,6 +148,40 @@ impl CentralInner {
             if let Some(task) = tasks.remove(&key) {
                 task.abort();
             }
+        }
+    }
+
+    /// Emit `DeviceDisconnected` at most once per established connection.
+    ///
+    /// Returns `false` if the device was already reported as disconnected,
+    /// which happens whenever two observers race — e.g. the `Connected`
+    /// watcher and a BlueZ `DeviceRemoved` for the same link drop.
+    fn emit_disconnect(&self, device_id: &DeviceId, cause: DisconnectCause) -> bool {
+        let was_connected = self.connected.lock().remove(device_id);
+        if !was_connected {
+            return false;
+        }
+        self.clear_mtu(device_id);
+        self.drain_notify_tasks(device_id);
+        let _ = self.event_tx.send(CentralEvent::DeviceDisconnected {
+            device_id: device_id.clone(),
+            cause,
+        });
+        true
+    }
+
+    /// Cause to report for a link that went down without us asking.
+    async fn involuntary_cause(&self) -> DisconnectCause {
+        if self.adapter.is_powered().await.unwrap_or(true) {
+            DisconnectCause::LinkLoss
+        } else {
+            DisconnectCause::AdapterOff
+        }
+    }
+
+    fn abort_connection_watcher(&self, device_id: &DeviceId) {
+        if let Some(task) = self.connection_tasks.lock().remove(device_id) {
+            task.abort();
         }
     }
 
@@ -214,6 +294,8 @@ impl CentralBackend for LinuxCentral {
             event_tx,
             scan_task: Mutex::new(None),
             notify_tasks: Mutex::new(HashMap::new()),
+            connection_tasks: Mutex::new(HashMap::new()),
+            connected: Mutex::new(HashSet::new()),
             adapter_task: Mutex::new(None),
         });
         let inner_clone = Arc::clone(&inner);
@@ -348,16 +430,9 @@ impl CentralBackend for LinuxCentral {
                             let device_id = DeviceId(addr.to_string());
                             debug!(device_id = %device_id, "device removed");
                             handle.discovered.lock().remove(&device_id);
-                            handle.clear_mtu(&device_id);
-                            handle.drain_notify_tasks(&device_id);
-                            let cause = if handle.adapter.is_powered().await.unwrap_or(true) {
-                                DisconnectCause::LinkLoss
-                            } else {
-                                DisconnectCause::AdapterOff
-                            };
-                            let _ = handle
-                                .event_tx
-                                .send(CentralEvent::DeviceDisconnected { device_id, cause });
+                            handle.abort_connection_watcher(&device_id);
+                            let cause = handle.involuntary_cause().await;
+                            handle.emit_disconnect(&device_id, cause);
                         }
                         AdapterEvent::PropertyChanged(_) => {}
                     }
@@ -415,16 +490,14 @@ impl CentralBackend for LinuxCentral {
                 .map_err(|e| BlewError::Central {
                     source: Box::new(e),
                 })?;
+            // Stop the watcher first so link-down from our own disconnect is
+            // reported as LocalClose rather than racing it as LinkLoss.
+            handle.abort_connection_watcher(&device_id);
             device.disconnect().await.map_err(|e| BlewError::Central {
                 source: Box::new(e),
             })?;
             debug!(device_id = %device_id, "device disconnected");
-            handle.clear_mtu(&device_id);
-            handle.drain_notify_tasks(&device_id);
-            let _ = handle.event_tx.send(CentralEvent::DeviceDisconnected {
-                device_id,
-                cause: DisconnectCause::LocalClose,
-            });
+            handle.emit_disconnect(&device_id, DisconnectCause::LocalClose);
             Ok(())
         }
     }
