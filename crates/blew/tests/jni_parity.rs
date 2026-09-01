@@ -11,6 +11,12 @@ const CENTRAL_KT: &str =
     include_str!("../android/src/main/java/org/jakebot/blew/BleCentralManager.kt");
 const PERIPHERAL_KT: &str =
     include_str!("../android/src/main/java/org/jakebot/blew/BlePeripheralManager.kt");
+// `BlewPluginNative`'s Kotlin lives in this crate's Android module but its Rust
+// hooks live in `tauri-plugin-blew`, so the pair falls between the two crates
+// and nothing checked it. Reaching across from here keeps one copy of the
+// parser rather than duplicating it in the other crate's tests.
+const PLUGIN_KT: &str = include_str!("../android/src/main/java/org/jakebot/blew/BlewPlugin.kt");
+const PLUGIN_RS: &str = include_str!("../../tauri-plugin-blew/src/lib.rs");
 
 /// A JNI-crossing function reduced to what has to match on both sides.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
@@ -18,6 +24,8 @@ struct Signature {
     name: String,
     /// Parameter types, normalised to the Kotlin spelling.
     params: Vec<String>,
+    /// Return type, normalised to the Kotlin spelling. `Unit` for no return.
+    returns: String,
 }
 
 /// Collect the text between the parens of a declaration that may wrap lines.
@@ -63,8 +71,9 @@ fn kotlin_external_funs(source: &str) -> BTreeSet<Signature> {
     let lines: Vec<&str> = source.lines().collect();
     let mut out = BTreeSet::new();
     for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix("external fun ") else {
+        // Not `strip_prefix`: the declaration is sometimes written
+        // `@JvmStatic external fun foo()` on a single line.
+        let Some(rest) = line.split_once("external fun ").map(|(_, rest)| rest) else {
             continue;
         };
         let Some(name) = rest.split('(').next() else {
@@ -75,22 +84,76 @@ fn kotlin_external_funs(source: &str) -> BTreeSet<Signature> {
         };
         let params = split_params(&block)
             .iter()
-            // "deviceName: String?" -> "String"
-            .filter_map(|p| p.split(':').nth(1))
+            // "deviceName: String?" -> "String". `splitn` rather than `split`
+            // so a qualified Rust path like `jni::sys::jboolean` survives.
+            .filter_map(|p| p.splitn(2, ':').nth(1))
             .map(|ty| ty.trim().trim_end_matches('?').to_string())
             .collect();
         out.insert(Signature {
             name: name.trim().to_string(),
             params,
+            returns: kotlin_return_type(&lines, i),
         });
     }
     out
 }
 
+/// Read the `: Type` that follows a Kotlin declaration's closing paren.
+/// Absent means `Unit`.
+fn kotlin_return_type(lines: &[&str], start: usize) -> String {
+    let mut depth = 0_i32;
+    for line in &lines[start..] {
+        for (idx, ch) in line.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let tail = line[idx + 1..].trim();
+                        return match tail.strip_prefix(':') {
+                            Some(ty) => ty.trim().trim_end_matches('?').to_string(),
+                            None => "Unit".to_string(),
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    "Unit".to_string()
+}
+
+/// Read the `-> Type` that follows a Rust declaration's closing paren.
+fn rust_return_type(lines: &[&str], start: usize) -> String {
+    let mut depth = 0_i32;
+    for line in &lines[start..] {
+        for (idx, ch) in line.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let tail = line[idx + 1..].trim();
+                        return match tail.strip_prefix("->") {
+                            Some(ty) => rust_type_to_kotlin(ty.trim().trim_end_matches('{').trim()),
+                            None => "Unit".to_string(),
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    "Unit".to_string()
+}
+
 /// Map a Rust JNI parameter type to the Kotlin type it must correspond to.
 /// Unknown types map to themselves so a mismatch shows up rather than passing.
 fn rust_type_to_kotlin(ty: &str) -> String {
-    match ty.trim() {
+    // `tauri-plugin-blew` writes these fully qualified (`jni::sys::jboolean`);
+    // blew's hooks import them. Compare on the last path segment either way.
+    let ty = ty.trim().rsplit("::").next().unwrap_or(ty).trim();
+    match ty {
         "JString" => "String",
         "jint" => "Int",
         "jlong" => "Long",
@@ -101,6 +164,7 @@ fn rust_type_to_kotlin(ty: &str) -> String {
         "jbyte" => "Byte",
         "JByteArray" => "ByteArray",
         "JObjectArray" => "Array",
+        "()" => "Unit",
         other => other,
     }
     .to_string()
@@ -136,7 +200,7 @@ fn rust_jni_symbols(source: &str) -> BTreeSet<(String, Signature)> {
         let params = split_params(&block)
             .iter()
             .skip(2) // env, class
-            .filter_map(|p| p.split(':').nth(1))
+            .filter_map(|p| p.splitn(2, ':').nth(1))
             .map(|ty| rust_type_to_kotlin(ty.trim().trim_start_matches("mut ")))
             .collect();
         out.insert((
@@ -144,6 +208,7 @@ fn rust_jni_symbols(source: &str) -> BTreeSet<(String, Signature)> {
             Signature {
                 name: method.to_string(),
                 params,
+                returns: rust_return_type(&lines, i),
             },
         ));
     }
@@ -158,9 +223,9 @@ fn rust_symbols_for_class(all: &BTreeSet<(String, Signature)>, class: &str) -> B
 }
 
 /// Compare one Kotlin class against its Rust hooks, by name *and* signature.
-fn assert_parity(class: &str, kt_source: &str) {
+fn assert_parity(class: &str, kt_source: &str, rs_source: &str) {
     let kt_funs = kotlin_external_funs(kt_source);
-    let rust_funs = rust_symbols_for_class(&rust_jni_symbols(JNI_HOOKS_RS), class);
+    let rust_funs = rust_symbols_for_class(&rust_jni_symbols(rs_source), class);
 
     let kt_names: BTreeSet<&String> = kt_funs.iter().map(|s| &s.name).collect();
     let rust_names: BTreeSet<&String> = rust_funs.iter().map(|s| &s.name).collect();
@@ -184,11 +249,11 @@ fn assert_parity(class: &str, kt_source: &str) {
     // JVM reports at call time as a crash, not at link time.
     for kt in &kt_funs {
         if let Some(rs) = rust_funs.iter().find(|r| r.name == kt.name)
-            && rs.params != kt.params
+            && (rs.params != kt.params || rs.returns != kt.returns)
         {
             failures.push(format!(
-                "signature mismatch for `{}`:\n    Kotlin: {:?}\n    Rust:   {:?}",
-                kt.name, kt.params, rs.params
+                "signature mismatch for `{}`:\n    Kotlin: {:?} -> {}\n    Rust:   {:?} -> {}",
+                kt.name, kt.params, kt.returns, rs.params, rs.returns
             ));
         }
     }
@@ -198,10 +263,15 @@ fn assert_parity(class: &str, kt_source: &str) {
 
 #[test]
 fn central_jni_parity() {
-    assert_parity("BleCentralManager", CENTRAL_KT);
+    assert_parity("BleCentralManager", CENTRAL_KT, JNI_HOOKS_RS);
 }
 
 #[test]
 fn peripheral_jni_parity() {
-    assert_parity("BlePeripheralManager", PERIPHERAL_KT);
+    assert_parity("BlePeripheralManager", PERIPHERAL_KT, JNI_HOOKS_RS);
+}
+
+#[test]
+fn plugin_jni_parity() {
+    assert_parity("BlewPluginNative", PLUGIN_KT, PLUGIN_RS);
 }

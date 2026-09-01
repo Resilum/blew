@@ -13,6 +13,11 @@ All notable changes to `blew` are documented here. Format follows
   (which generates the Tauri annotations the plugin sources need) and then
   runs `compileDebugKotlin`. Locally: `mise run ci:compile-kotlin`.
 
+- The JNI parity test now covers `BlewPluginNative` and compares **return
+  types** as well as parameters. Those two hooks had their Kotlin in `blew`
+  and their Rust in `tauri-plugin-blew`, so they fell between the crates and
+  nothing checked them at all.
+
 - The JNI parity test now compares **signatures**, not just names. It reports
   arity and per-parameter type drift between each Kotlin `external fun` and
   its Rust `extern "C"` hook — a mismatch the JVM otherwise only surfaces as a
@@ -101,6 +106,33 @@ All notable changes to `blew` are documented here. Format follows
   new `clippy::unused_async_trait_impl` error that broke the CI lint gate.
 
 ### Fixed
+
+- **Android: constructing a role before the Tauri plugin finished loading no
+  longer reports `PermissionDenied`.** The Kotlin singletons only received a
+  `Context` from `BlewPlugin.load()`, which runs after plugin setup returns —
+  and a missing `Context` answers the permission check exactly as a denial
+  does. `init_jvm` now hands them the application context itself, closing the
+  window. An application that never registered the plugin at all gets the new
+  `BlewError::NotInitialized` instead of a panic or a misleading denial.
+
+- **Android: adapter state events are no longer duplicated after the host
+  activity is recreated.** `BleCentralManager.init` / `BlePeripheralManager.init`
+  ended in an unguarded `registerReceiver`, and `load()` runs again on every
+  recreation — a rotation is enough — so registrations accumulated with
+  nothing ever unregistering.
+
+- **`init_jvm` no longer panics when called twice.** Aborting the process
+  because a plugin setup ran twice was a sharp edge; the second call has
+  nothing new to do.
+
+- **tauri-plugin-blew: plugin setup can no longer hang forever at startup.**
+  It blocked on an unbounded wait for wry to run a closure on the Android main
+  thread. That is now bounded, so a main thread that never runs it fails setup
+  with a message rather than hanging silently on a device.
+
+- **tauri-plugin-blew: the host `Activity` is no longer leaked.** `BlewPlugin`
+  held it in a static, keeping a destroyed instance alive across every
+  recreation; it is a `WeakReference` now.
 
 - **Apple: a peer closing an L2CAP channel cleanly is now observed.** The read
   loop only reported EOF via a zero-length read, which a clean close never
