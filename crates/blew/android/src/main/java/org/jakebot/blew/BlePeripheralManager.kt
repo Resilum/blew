@@ -171,6 +171,9 @@ object BlePeripheralManager {
             }
         }
 
+    @Volatile
+    private var receiverRegistered = false
+
     fun init(ctx: Context) {
         context = ctx
         bluetoothManager = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -179,8 +182,15 @@ object BlePeripheralManager {
             advertiser = adapter.bluetoothLeAdvertiser
         }
         Log.d(TAG, "initialized, adapter=${adapter != null}, advertiser=${advertiser != null}")
-        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
-        ctx.registerReceiver(adapterStateReceiver, filter)
+        // Registering the same receiver twice delivers every adapter state
+        // change twice. init() runs again whenever the host activity is
+        // recreated -- a rotation or a dark-mode toggle is enough -- and
+        // nothing ever unregisters, so the duplicates would accumulate.
+        if (!receiverRegistered) {
+            val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+            ctx.registerReceiver(adapterStateReceiver, filter)
+            receiverRegistered = true
+        }
     }
 
     private val gattCallback =

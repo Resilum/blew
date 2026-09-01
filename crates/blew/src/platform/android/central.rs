@@ -195,6 +195,13 @@ impl AndroidCentral {
     // mirrors the Apple/Linux async initializers for cross-platform parity.
     #[allow(clippy::unused_async)]
     pub async fn with_config(config: CentralConfig) -> crate::error::BlewResult<Self> {
+        // Distinguish "you forgot to register the plugin" from "the user said
+        // no". Without this the former reports as PermissionDenied, because a
+        // Kotlin manager with no Context answers the permission check exactly
+        // as a denial does.
+        if !super::jni_globals::is_initialized() {
+            return Err(BlewError::NotInitialized);
+        }
         if !super::are_ble_permissions_granted() {
             return Err(BlewError::PermissionDenied);
         }

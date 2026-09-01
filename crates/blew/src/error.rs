@@ -19,6 +19,12 @@ pub enum BlewError {
     #[error("required Android BLE permissions are not granted")]
     PermissionDenied,
 
+    #[error(
+        "Android BLE support is not initialised — register tauri-plugin-blew, \
+         or call blew::platform::android::init_jvm before constructing a role"
+    )]
+    NotInitialized,
+
     #[error("device not found: {0}")]
     DeviceNotFound(DeviceId),
 

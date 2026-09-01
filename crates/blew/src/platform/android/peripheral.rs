@@ -59,6 +59,13 @@ impl PeripheralBackend for AndroidPeripheral {
     where
         Self: Sized,
     {
+        // Distinguish "you forgot to register the plugin" from "the user said
+        // no". Without this the former reports as PermissionDenied, because a
+        // Kotlin manager with no Context answers the permission check exactly
+        // as a denial does.
+        if !super::jni_globals::is_initialized() {
+            return Err(BlewError::NotInitialized);
+        }
         if !super::are_ble_permissions_granted() {
             return Err(BlewError::PermissionDenied);
         }
