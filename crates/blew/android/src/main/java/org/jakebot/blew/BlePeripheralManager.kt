@@ -411,10 +411,19 @@ object BlePeripheralManager {
         }
     }
 
+    /**
+     * Guards [advertiseCallback] / [advertiseRequestId] / [advertiser].
+     *
+     * start, stop and cancel arrive on JNI threads while AdvertiseCallback
+     * fires on the stack's own; unsynchronized, a stop could pass through the
+     * gap between start deciding to advertise and recording its callback, and
+     * advertising would begin after stop had returned.
+     */
+    private val advertiseLock = Any()
+
     private var advertiseCallback: AdvertiseCallback? = null
 
     /** Request id of the live [advertiseCallback], for [cancelAdvertising]. */
-    @Volatile
     private var advertiseRequestId: Int = 0
 
     /**
@@ -426,6 +435,12 @@ object BlePeripheralManager {
      */
     @JvmStatic
     fun startAdvertising(
+        name: String,
+        serviceUuids: Array<String>,
+        requestId: Int,
+    ): Int = synchronized(advertiseLock) { startAdvertisingLocked(name, serviceUuids, requestId) }
+
+    private fun startAdvertisingLocked(
         name: String,
         serviceUuids: Array<String>,
         requestId: Int,
@@ -486,9 +501,13 @@ object BlePeripheralManager {
                     Log.e(TAG, "advertising failed: errorCode=$errorCode")
                     // Nothing started, so there is nothing to stop -- release
                     // the slot or every later start would report ALREADY.
-                    if (advertiseRequestId == requestId) {
-                        advertiseCallback = null
+                    synchronized(advertiseLock) {
+                        if (advertiseRequestId == requestId) {
+                            advertiseCallback = null
+                        }
                     }
+                    // Outside the monitor: this crosses into Rust, which takes
+                    // its own lock, and there is no reason to hold both.
                     nativeOnAdvertisingResult(requestId, false, errorCode)
                 }
             }
@@ -499,9 +518,11 @@ object BlePeripheralManager {
 
     @JvmStatic
     fun stopAdvertising() {
-        advertiseCallback?.let { cb ->
-            advertiser?.stopAdvertising(cb)
-            advertiseCallback = null
+        synchronized(advertiseLock) {
+            advertiseCallback?.let { cb ->
+                advertiser?.stopAdvertising(cb)
+                advertiseCallback = null
+            }
         }
         Log.d(TAG, "advertising stopped")
     }
@@ -516,9 +537,12 @@ object BlePeripheralManager {
      */
     @JvmStatic
     fun cancelAdvertising(requestId: Int) {
-        if (advertiseRequestId == requestId && advertiseCallback != null) {
-            Log.d(TAG, "cancelling advertising request $requestId")
-            stopAdvertising()
+        // `synchronized` is reentrant, so the nested stopAdvertising is fine.
+        synchronized(advertiseLock) {
+            if (advertiseRequestId == requestId && advertiseCallback != null) {
+                Log.d(TAG, "cancelling advertising request $requestId")
+                stopAdvertising()
+            }
         }
     }
 

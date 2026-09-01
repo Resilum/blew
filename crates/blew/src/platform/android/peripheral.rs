@@ -16,6 +16,7 @@ use crate::peripheral::types::{
 };
 use crate::types::DeviceId;
 use crate::util::BroadcastEventStream;
+use crate::util::advertise_state::{AdvertiseState, Advertising};
 
 use super::jni_globals::{jvm, peripheral_class};
 
@@ -26,27 +27,23 @@ const ADVERTISE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 
 /// Kotlin's `BlePeripheralManager.ADVERTISE_OK`.
 const ADVERTISE_OK: i32 = 0;
-
-/// Advertising bookkeeping.
-///
-/// Requests carry an id because `AdvertiseCallback` is asynchronous and cannot
-/// be un-registered: a request we gave up on can still deliver its result
-/// afterwards, and without an id that late result would complete whatever
-/// request happened to be waiting by then.
-#[derive(Default)]
-struct AdvertiseState {
-    next_id: i32,
-    /// The one request currently awaiting a callback, if any.
-    pending: Option<(i32, oneshot::Sender<BlewResult<()>>)>,
-    /// Set once the stack confirms advertising started, cleared by `stop`.
-    active: bool,
-}
+/// Kotlin's `BlePeripheralManager.ADVERTISE_ALREADY`. Kotlin guards
+/// independently of the Rust slot, so this can still come back.
+const ADVERTISE_ALREADY: i32 = 2;
 
 struct PeripheralState {
     request_tx: mpsc::UnboundedSender<PeripheralRequest>,
     request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
     state_tx: broadcast::Sender<PeripheralStateEvent>,
     advertise: Mutex<AdvertiseState>,
+}
+
+/// Run `f` against the advertising state, if the backend is initialised.
+fn with_advertise<T>(f: impl FnOnce(&mut AdvertiseState) -> T) -> Option<T> {
+    let guard = STATE.lock();
+    let s = guard.as_ref()?;
+    let mut adv = s.advertise.lock();
+    Some(f(&mut adv))
 }
 
 /// Claim the advertising slot, returning the request id and its waiter.
@@ -56,40 +53,58 @@ struct PeripheralState {
 /// start would strand the first one running with no way to stop it. Every
 /// other backend already rejects this with `AlreadyAdvertising`.
 fn register_advertise() -> BlewResult<(i32, oneshot::Receiver<BlewResult<()>>)> {
-    let guard = STATE.lock();
-    let Some(s) = guard.as_ref() else {
-        return Err(BlewError::NotInitialized);
-    };
-    let mut adv = s.advertise.lock();
-    if adv.active || adv.pending.is_some() {
-        return Err(BlewError::AlreadyAdvertising);
-    }
-    adv.next_id = adv.next_id.wrapping_add(1);
-    let id = adv.next_id;
-    let (tx, rx) = oneshot::channel();
-    adv.pending = Some((id, tx));
-    Ok((id, rx))
+    with_advertise(AdvertiseState::register)
+        .ok_or(BlewError::NotInitialized)?
+        .ok_or(BlewError::AlreadyAdvertising)
 }
 
-/// Drop the waiter for `request_id`, if it is still the current one.
-fn clear_advertise(request_id: i32) {
-    let guard = STATE.lock();
-    if let Some(s) = guard.as_ref() {
-        let mut adv = s.advertise.lock();
-        if adv
-            .pending
-            .as_ref()
-            .is_some_and(|(id, _)| *id == request_id)
-        {
-            adv.pending = None;
+/// Return the slot to `Idle` if `request_id` still owns it.
+///
+/// Applies to a request in either state: a caller that was dropped after the
+/// stack confirmed its start still needs the advertisement torn down, since
+/// nobody ever received the `Ok`.
+fn release_advertise(request_id: i32) -> bool {
+    with_advertise(|adv| adv.release(request_id)).unwrap_or(false)
+}
+
+/// Take the slot regardless of who owns it, for `stop_advertising`.
+///
+/// Returns the displaced state so the caller can wake a start that was still
+/// in flight rather than leaving it to time out.
+fn take_advertise() -> Advertising {
+    with_advertise(AdvertiseState::take).unwrap_or(Advertising::Idle)
+}
+
+/// Releases the slot and tears down the stack-side request unless disarmed.
+///
+/// A guard rather than cleanup on the error path, because `start_advertising`
+/// can also be *dropped* mid-await -- a `select!`, an outer timeout, a
+/// cancelled task -- and that skips any cleanup written as ordinary code,
+/// leaving the slot claimed and the radio advertising with nothing able to
+/// reach it.
+struct AdvertiseGuard {
+    request_id: i32,
+    armed: bool,
+}
+
+impl AdvertiseGuard {
+    fn new(request_id: i32) -> Self {
+        Self {
+            request_id,
+            armed: true,
         }
     }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
-fn set_advertise_active(active: bool) {
-    let guard = STATE.lock();
-    if let Some(s) = guard.as_ref() {
-        s.advertise.lock().active = active;
+impl Drop for AdvertiseGuard {
+    fn drop(&mut self) {
+        if self.armed && release_advertise(self.request_id) {
+            cancel_advertise(self.request_id);
+        }
     }
 }
 
@@ -115,28 +130,24 @@ static STATE: Mutex<Option<PeripheralState>> = Mutex::new(None);
 
 /// Deliver the stack's advertising outcome to a waiting `start_advertising`.
 ///
-/// A result for a request we already abandoned is dropped rather than applied
-/// to whoever is waiting now.
+/// The `Starting` -> `Active` transition happens here, under the same lock
+/// that takes the waiter and before the waiting task is woken. Doing it in the
+/// woken task instead leaves a window where a `stop` can run against a state
+/// that says "starting", and the resuming task then marks the slot active
+/// after the platform has already been stopped -- permanently wedging every
+/// later start on `AlreadyAdvertising`.
 pub(crate) fn complete_advertise(request_id: i32, result: BlewResult<()>) {
-    let tx = {
-        let guard = STATE.lock();
-        let Some(s) = guard.as_ref() else { return };
-        let mut adv = s.advertise.lock();
-        match adv.pending.take() {
-            Some((id, tx)) if id == request_id => Some(tx),
-            // Not ours: put back whoever is actually waiting.
-            other => {
-                adv.pending = other;
-                tracing::debug!(
-                    request_id,
-                    "ignoring advertising result for a stale request"
-                );
-                None
-            }
+    let tx = with_advertise(|adv| adv.complete(request_id, result.is_ok())).flatten();
+    match tx {
+        Some(tx) => {
+            let _ = tx.send(result);
         }
-    };
-    if let Some(tx) = tx {
-        let _ = tx.send(result);
+        None => {
+            tracing::debug!(
+                request_id,
+                "ignoring advertising result for a stale request"
+            );
+        }
     }
 }
 
@@ -193,10 +204,14 @@ async fn drive_advertising(
         })
         .map_err(|e| jni_err(&e))?;
 
-    if code != ADVERTISE_OK {
-        return Err(BlewError::Peripheral {
-            source: "advertiser unavailable (is Bluetooth on?)".into(),
-        });
+    match code {
+        ADVERTISE_OK => {}
+        ADVERTISE_ALREADY => return Err(BlewError::AlreadyAdvertising),
+        _ => {
+            return Err(BlewError::Peripheral {
+                source: "advertiser unavailable (is Bluetooth on?)".into(),
+            });
+        }
     }
 
     // The synchronous return only says the request reached the stack. Whether
@@ -335,22 +350,31 @@ impl PeripheralBackend for AndroidPeripheral {
         // Claimed before the JNI call: AdvertiseCallback can fire before the
         // call has even returned.
         let (request_id, rx) = register_advertise()?;
+        // Covers every way out, including this future being dropped mid-await.
+        let mut guard = AdvertiseGuard::new(request_id);
         let result = drive_advertising(config, request_id, rx).await;
-        match &result {
-            Ok(()) => set_advertise_active(true),
-            Err(_) => {
-                // Whatever went wrong, this request must not be left owning the
-                // slot, and the stack must not be left advertising behind a
-                // callback nothing can reach.
-                clear_advertise(request_id);
-                cancel_advertise(request_id);
-            }
+        if result.is_ok() {
+            // `complete_advertise` already moved the slot to Active.
+            guard.disarm();
         }
         result
     }
 
     async fn stop_advertising(&self) -> BlewResult<()> {
-        set_advertise_active(false);
+        // Take the slot whatever state it is in. Clearing only an `active`
+        // flag left a start still in flight owning the slot, so a stop during
+        // startup blocked every later start until that request timed out.
+        match take_advertise() {
+            Advertising::Starting(_, tx) => {
+                // Wake the start rather than leaving it on its deadline. Its
+                // guard sees the error and tears the request down.
+                let _ = tx.send(Err(BlewError::Peripheral {
+                    source: "advertising stopped before it started".into(),
+                }));
+            }
+            Advertising::Active(_) | Advertising::Idle => {}
+        }
+
         jvm()
             .attach_current_thread(|env| {
                 env.call_static_method(

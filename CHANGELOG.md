@@ -124,6 +124,28 @@ All notable changes to `blew` are documented here. Format follows
   exact `AdvertiseCallback` it was started with, the first advertisement was
   left running with nothing able to reach it.
 
+- **Android: advertising state is a single value, not a flag beside a slot.**
+  The `Starting` → `Active` transition now happens under the same lock that
+  takes the waiter, before the waiting task is woken. Previously a `stop`
+  landing between the wake-up and the flag being set was undone by the
+  resuming task, which left the slot claimed while the radio was idle and
+  wedged every later start on `AlreadyAdvertising`. A `stop` during startup
+  also takes the slot and wakes the in-flight start rather than letting it sit
+  out its deadline, and `start_advertising` cleans up through a guard so a
+  dropped or cancelled future cannot leave the radio advertising behind a
+  callback nothing can reach. The state machine lives in
+  `util::advertise_state` so it is unit-tested on every host rather than only
+  on a device.
+
+- **Android: the Kotlin advertising state is synchronized.** `startAdvertising`,
+  `stopAdvertising`, `cancelAdvertising` and the `AdvertiseCallback` mutate the
+  same fields from JNI and stack threads; a stop could previously pass through
+  the gap between a start deciding to advertise and recording its callback, so
+  advertising began after the stop had returned.
+
+- **Android: a refusal from the Kotlin side maps to `AlreadyAdvertising`**
+  rather than being collapsed into "advertiser unavailable".
+
 - **Android: an abandoned advertising request can no longer complete a later
   one.** Requests carry an id, so a callback arriving after a timeout is
   dropped rather than applied to whoever is waiting by then, and the failure
