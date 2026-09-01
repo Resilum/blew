@@ -5,6 +5,8 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.0-beta.1] — 2026-09-01
+
 ### Added
 
 - **CI now compiles the Android Kotlin.** It previously ran only ktlint, which
@@ -346,6 +348,8 @@ All notable changes to `blew` are documented here. Format follows
   `Info.plist` parsing and did not affect `blew` itself. `tauri` also moves
   2.11.0 → 2.11.5 and `tauri-build` / `tauri-plugin` 2.6.0 → 2.6.3.
 
+---
+
 ## [0.3.0] — 2026-04-22
 
 ### Added
@@ -637,7 +641,7 @@ bluer's own state machine.
 
 ---
 
-## Upgrade guide — 0.3.x → Unreleased
+## Upgrade guide — 0.3.x → 0.4.0
 
 **If you were constructing `CentralConfig` or `PeripheralConfig` as a struct
 literal naming every field**, both gain an `l2cap` field:
