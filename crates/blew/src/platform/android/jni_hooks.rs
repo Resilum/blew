@@ -717,6 +717,28 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnL2capCh
     });
 }
 
+/// Asynchronous outcome of `startAdvertising`, from the stack's
+/// `AdvertiseCallback`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnAdvertisingResult(
+    _env: EnvUnowned,
+    _class: JClass,
+    success: jboolean,
+    error_code: jint,
+) {
+    guard("nativeOnAdvertisingResult", || {
+        let result = if success {
+            Ok(())
+        } else {
+            Err(crate::error::BlewError::Peripheral {
+                source: format!("advertising failed (AdvertiseCallback error {error_code})").into(),
+            })
+        };
+        trace!(success, error_code, "advertising result");
+        super::peripheral::complete_advertise(result);
+    });
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnL2capChannelClosed(
     mut env: EnvUnowned,

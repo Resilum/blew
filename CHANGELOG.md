@@ -42,6 +42,15 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Changed
 
+- **Breaking: `Peripheral::start_advertising` now waits for the stack to
+  confirm.** On Android it returned `Ok(())` as soon as the request reached
+  `BluetoothLeAdvertiser`, so a peripheral that failed to start — too many
+  advertisers, an unsupported payload, Bluetooth off — reported success and
+  was silently invisible. It now awaits `AdvertiseCallback` and surfaces the
+  failure, matching what the Apple backend already did. Callers that ignored
+  the result see no change; callers that checked it may now see errors they
+  previously did not.
+
 - **Closing an L2CAP channel now lingers instead of discarding.** Both
   `close()` and dropping the channel hand it to the backend, which keeps
   writing whatever is still queued until the queue empties or
@@ -106,6 +115,27 @@ All notable changes to `blew` are documented here. Format follows
   new `clippy::unused_async_trait_impl` error that broke the CI lint gate.
 
 ### Fixed
+
+- **Android: the advertiser is resolved per call instead of cached at init.**
+  `getBluetoothLeAdvertiser` returns null while Bluetooth is off, and nothing
+  refreshed the cached null when it came back on — so a peripheral initialised
+  with Bluetooth off could never advertise for the life of the process.
+
+- **tauri-plugin-blew: the startup `Activity` is no longer retained for the
+  life of the process.** `ndk_context` was given a global reference to the
+  `Activity`, which keeps its whole view hierarchy — `WebView` included —
+  alive past every recreation. It now receives the application context, which
+  is all either consumer needs: both want a classloader, and the
+  `Application`'s is the same one. (The `WeakReference` change below removed a
+  second, smaller leak; this is the one that dominated.)
+
+- **Android: the public permission helpers no longer panic before
+  initialisation.** `are_ble_permissions_granted`, `request_ble_permissions`
+  and `is_emulator` all reached a panicking JVM accessor if the plugin had not
+  been registered — including through `tauri-plugin-blew`'s wrappers, and
+  despite `request_ble_permissions` documenting a no-op for exactly that case.
+  They now report `false`/no-op with a warning, and the new `is_initialized()`
+  (on both crates) distinguishes that from a genuine denial.
 
 - **Android: constructing a role before the Tauri plugin finished loading no
   longer reports `PermissionDenied`.** The Kotlin singletons only received a

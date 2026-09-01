@@ -60,11 +60,32 @@ impl Default for BlewPluginConfig {
 
 /// Check whether Android BLE runtime permissions have been granted.
 ///
-/// Always returns `true` on non-Android platforms.
+/// Returns `false` on Android if the plugin has not finished initialising —
+/// use [`is_initialized`] to tell that apart from a genuine denial.
+///
+/// Always returns `true` on non-Android platforms, which have no runtime BLE
+/// permission to grant.
 pub fn are_ble_permissions_granted() -> bool {
     #[cfg(target_os = "android")]
     {
         blew::platform::android::are_ble_permissions_granted()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        true
+    }
+}
+
+/// Whether blew's Android bridge has been initialised.
+///
+/// False until the plugin's `setup` has run. The permission helpers below
+/// report `false`/no-op before that, which is otherwise indistinguishable from
+/// a denial. Always `true` on non-Android platforms, which need no bridge.
+#[must_use]
+pub fn is_initialized() -> bool {
+    #[cfg(target_os = "android")]
+    {
+        blew::platform::android::is_initialized()
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -168,8 +189,22 @@ fn install_android_context() -> Result<*mut std::ffi::c_void, Box<dyn std::error
     dispatch(move |env, activity, _webview| {
         let result: Result<_, wry_jni::errors::Error> = (|| {
             let vm = env.get_java_vm()?;
-            let activity_global = env.new_global_ref(activity)?;
-            Ok((vm, activity_global))
+            // The *application* context, not the Activity. ndk_context holds
+            // whatever it is given for the life of the process, and an Activity
+            // held that long drags its entire view hierarchy -- WebView
+            // included -- past every recreation. Nothing that reads this back
+            // needs an Activity: both consumers in this workspace want a
+            // classloader, and the Application's is the same one.
+            let app_context = env
+                .call_method(
+                    activity,
+                    "getApplicationContext",
+                    "()Landroid/content/Context;",
+                    &[],
+                )?
+                .l()?;
+            let context_global = env.new_global_ref(app_context)?;
+            Ok((vm, context_global))
         })();
         let _ = tx.send(result);
     });
@@ -179,7 +214,7 @@ fn install_android_context() -> Result<*mut std::ffi::c_void, Box<dyn std::error
     // unbounded wait here is a silent hang at startup with no log and no
     // error, on a device, which is close to undiagnosable. A timeout turns
     // that into a plugin-setup failure that says what happened.
-    let (vm, activity_global) = rx
+    let (vm, context_global) = rx
         .recv_timeout(DISPATCH_TIMEOUT)
         .map_err(|e| {
             format!(
@@ -190,13 +225,15 @@ fn install_android_context() -> Result<*mut std::ffi::c_void, Box<dyn std::error
         .map_err(|e| format!("JNI error capturing JVM/activity: {e}"))?;
 
     let vm_ptr = vm.get_java_vm_pointer() as *mut c_void;
-    let activity_ptr = activity_global.as_obj().as_raw() as *mut c_void;
+    let context_ptr = context_global.as_obj().as_raw() as *mut c_void;
     unsafe {
-        ndk_context::initialize_android_context(vm_ptr, activity_ptr);
+        ndk_context::initialize_android_context(vm_ptr, context_ptr);
     }
-    // ndk_context borrows the activity for the lifetime of the process; leak the
-    // global ref so the JNI ref the activity pointer refers to is never freed.
-    std::mem::forget(activity_global);
+    // ndk_context borrows the context for the lifetime of the process; leak the
+    // global ref so the JNI ref the pointer refers to is never freed. The
+    // Application object lives that long anyway, so unlike an Activity nothing
+    // is kept alive that would otherwise have been collected.
+    std::mem::forget(context_global);
     Ok(vm_ptr)
 }
 

@@ -5,15 +5,21 @@ pub(crate) mod l2cap_state;
 pub mod peripheral;
 
 pub use central::AndroidCentral;
-pub use jni_globals::init_jvm;
+pub use jni_globals::{init_jvm, is_initialized};
 pub use peripheral::AndroidPeripheral;
 
 /// Check whether the app is running on an Android emulator.
 ///
 /// Checks `Build.FINGERPRINT` for known emulator markers ("generic", "emulator", "sdk").
+///
+/// Returns `false` when [`init_jvm`] has not run, since there is nothing to
+/// ask.
 #[must_use]
 pub fn is_emulator() -> bool {
     use jni::{jni_sig, jni_str};
+    if !is_initialized() {
+        return false;
+    }
     let result: Result<bool, jni::errors::Error> =
         jni_globals::jvm().attach_current_thread(|env| {
             let build_class = env.find_class(jni_str!("android/os/Build"))?;
@@ -34,11 +40,22 @@ pub fn is_emulator() -> bool {
 
 /// Check whether Android BLE runtime permissions have been granted.
 ///
-/// Returns `true` when all required permissions are in place, `false` otherwise.
-/// This is Android-specific; other platforms always return `true`.
+/// Returns `true` when all required permissions are in place, `false`
+/// otherwise. This is Android-specific; other platforms always return `true`.
+///
+/// Also returns `false` — with a warning — when [`init_jvm`] has not run,
+/// since there is nothing to ask. Use [`is_initialized`] to tell that case
+/// apart from a real denial.
 #[must_use]
 pub fn are_ble_permissions_granted() -> bool {
     use jni::{jni_sig, jni_str};
+    if !is_initialized() {
+        tracing::warn!(
+            "are_ble_permissions_granted called before init_jvm; \
+             register tauri-plugin-blew or call init_jvm first"
+        );
+        return false;
+    }
     let result: Result<bool, jni::errors::Error> =
         jni_globals::jvm().attach_current_thread(|env| {
             let result = env.call_static_method(
@@ -59,18 +76,27 @@ pub fn are_ble_permissions_granted() -> bool {
 /// to learn the result.
 ///
 /// Requires the `org.jakebot.blew.BlewPlugin` class to be loaded (i.e. the
-/// Tauri plugin has been registered and its `load()` has run). If the class
-/// is unavailable or the host activity hasn't been captured yet, this is a
-/// no-op and a warning is logged.
+/// Tauri plugin has been registered and its `load()` has run). If [`init_jvm`]
+/// has not run, the class is unavailable, or the host activity hasn't been
+/// captured yet, this is a no-op and a warning is logged.
 pub fn request_ble_permissions() {
     use jni::objects::{JObject, JValue};
     use jni::{jni_sig, jni_str};
+    if !is_initialized() {
+        tracing::warn!(
+            "request_ble_permissions called before init_jvm; \
+             register tauri-plugin-blew or call init_jvm first"
+        );
+        return;
+    }
     let result: Result<(), jni::errors::Error> = jni_globals::jvm().attach_current_thread(|env| {
-        let activity =
+        // Only the classloader is needed here; the Activity the dialog is
+        // shown on is `BlewPlugin`'s own, on the Kotlin side.
+        let context =
             unsafe { JObject::from_raw(env, ndk_context::android_context().context().cast()) };
         let class_loader = env
             .call_method(
-                &activity,
+                &context,
                 jni_str!("getClassLoader"),
                 jni_sig!("()Ljava/lang/ClassLoader;"),
                 &[],

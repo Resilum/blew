@@ -26,11 +26,13 @@ pub fn init_jvm(vm: JavaVM) {
         return;
     }
     vm.attach_current_thread(|env| {
-        let activity =
+        // The application context, not an Activity -- see
+        // `tauri-plugin-blew`'s `install_android_context`.
+        let context =
             unsafe { JObject::from_raw(env, ndk_context::android_context().context().cast()) };
         let class_loader = env
             .call_method(
-                &activity,
+                &context,
                 jni_str!("getClassLoader"),
                 jni_sig!("()Ljava/lang/ClassLoader;"),
                 &[],
@@ -55,7 +57,7 @@ pub fn init_jvm(vm: JavaVM) {
         // idempotent, so `load()` calling it again is harmless.
         let app_context = env
             .call_method(
-                &activity,
+                &context,
                 jni_str!("getApplicationContext"),
                 jni_sig!("()Landroid/content/Context;"),
                 &[],
@@ -76,9 +78,9 @@ pub fn init_jvm(vm: JavaVM) {
         let _ = CLASS_CENTRAL.set(central_ref);
         let _ = CLASS_PERIPHERAL.set(peripheral_ref);
 
-        // `activity` is a borrowed local ref from ndk_context; `JObject` has no
+        // `context` is a borrowed local ref from ndk_context; `JObject` has no
         // Drop impl, so letting it fall out of scope is a no-op.
-        let _ = activity;
+        let _ = context;
 
         Ok::<_, jni::errors::Error>(())
     })

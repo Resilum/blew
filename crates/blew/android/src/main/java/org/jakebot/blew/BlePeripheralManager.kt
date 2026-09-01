@@ -32,6 +32,12 @@ import java.util.concurrent.TimeUnit
 object BlePeripheralManager {
     private const val TAG = "BlePeripheralManager"
 
+    /** startAdvertising handed the request to the stack. */
+    const val ADVERTISE_OK = 0
+
+    /** No advertiser — Bluetooth is off, or the radio cannot advertise. */
+    const val ADVERTISE_UNAVAILABLE = 1
+
     private var context: Context? = null
     private var bluetoothManager: BluetoothManager? = null
 
@@ -149,6 +155,13 @@ object BlePeripheralManager {
         data: ByteArray,
     )
 
+    /** Async outcome of [startAdvertising], from the stack's AdvertiseCallback. */
+    @JvmStatic
+    external fun nativeOnAdvertisingResult(
+        success: Boolean,
+        errorCode: Int,
+    )
+
     @JvmStatic
     external fun nativeOnL2capChannelClosed(
         socketId: Int,
@@ -178,10 +191,10 @@ object BlePeripheralManager {
         context = ctx
         bluetoothManager = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val adapter = bluetoothManager?.adapter
-        if (adapter != null) {
-            advertiser = adapter.bluetoothLeAdvertiser
-        }
-        Log.d(TAG, "initialized, adapter=${adapter != null}, advertiser=${advertiser != null}")
+        // The advertiser is deliberately not cached here: getBluetoothLeAdvertiser
+        // returns null while Bluetooth is off, and nothing refreshes a cached
+        // null when it comes back on. It is resolved per startAdvertising call.
+        Log.d(TAG, "initialized, adapter=${adapter != null}")
         // Registering the same receiver twice delivers every adapter state
         // change twice. init() runs again whenever the host activity is
         // recreated -- a rotation or a dark-mode toggle is enough -- and
@@ -396,16 +409,27 @@ object BlePeripheralManager {
 
     private var advertiseCallback: AdvertiseCallback? = null
 
+    /**
+     * Begin advertising. Returns [ADVERTISE_OK] when the request was handed to
+     * the stack, or a failure code for something that went wrong before that.
+     *
+     * Success is *not* confirmed by the return value — the stack reports that
+     * asynchronously through [nativeOnAdvertisingResult].
+     */
     @JvmStatic
     fun startAdvertising(
         name: String,
         serviceUuids: Array<String>,
-    ) {
+    ): Int {
+        // Resolved per call: null while Bluetooth is off, and valid again once
+        // it comes back on.
         val adv =
-            advertiser ?: run {
-                Log.e(TAG, "advertiser not available")
-                return
+            bluetoothManager?.adapter?.bluetoothLeAdvertiser ?: run {
+                Log.e(TAG, "advertiser not available (is Bluetooth on?)")
+                return ADVERTISE_UNAVAILABLE
             }
+        // Remembered so stopAdvertising passes the same instance back.
+        advertiser = adv
 
         bluetoothManager?.adapter?.name = name
 
@@ -437,14 +461,17 @@ object BlePeripheralManager {
             object : AdvertiseCallback() {
                 override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
                     Log.d(TAG, "advertising started")
+                    nativeOnAdvertisingResult(true, 0)
                 }
 
                 override fun onStartFailure(errorCode: Int) {
                     Log.e(TAG, "advertising failed: errorCode=$errorCode")
+                    nativeOnAdvertisingResult(false, errorCode)
                 }
             }
 
         adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
+        return ADVERTISE_OK
     }
 
     @JvmStatic

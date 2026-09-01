@@ -19,13 +19,34 @@ use crate::util::BroadcastEventStream;
 
 use super::jni_globals::{jvm, peripheral_class};
 
+/// How long to wait for the stack's `AdvertiseCallback` before giving up.
+/// Advertising either starts or fails almost immediately; this only bounds a
+/// callback that never arrives at all.
+const ADVERTISE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Kotlin's `BlePeripheralManager.ADVERTISE_OK`.
+const ADVERTISE_OK: i32 = 0;
+
 struct PeripheralState {
     request_tx: mpsc::UnboundedSender<PeripheralRequest>,
     request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
     state_tx: broadcast::Sender<PeripheralStateEvent>,
+    /// Waiter for the asynchronous outcome of `startAdvertising`.
+    pending_advertise: Mutex<Option<oneshot::Sender<BlewResult<()>>>>,
 }
 
 static STATE: Mutex<Option<PeripheralState>> = Mutex::new(None);
+
+/// Deliver the stack's advertising outcome to a waiting `start_advertising`.
+pub(crate) fn complete_advertise(result: BlewResult<()>) {
+    let tx = STATE
+        .lock()
+        .as_ref()
+        .and_then(|s| s.pending_advertise.lock().take());
+    if let Some(tx) = tx {
+        let _ = tx.send(result);
+    }
+}
 
 pub(crate) fn send_request(request: PeripheralRequest) {
     if let Some(s) = STATE.lock().as_ref() {
@@ -75,6 +96,7 @@ impl PeripheralBackend for AndroidPeripheral {
             request_tx,
             request_rx: Mutex::new(Some(request_rx)),
             state_tx,
+            pending_advertise: Mutex::new(None),
         });
         // The L2CAP statics are shared between the two roles but were only
         // initialised from the central path. A peripheral-only app would find
@@ -161,7 +183,16 @@ impl PeripheralBackend for AndroidPeripheral {
         let uuid_count = i32::try_from(config.service_uuids.len()).map_err(|_| {
             BlewError::Internal("too many service UUIDs in AdvertisingConfig".into())
         })?;
-        jvm()
+        let (tx, rx) = oneshot::channel();
+        // Registered before the call: AdvertiseCallback can fire before the
+        // JNI call has even returned.
+        if let Some(s) = STATE.lock().as_ref() {
+            *s.pending_advertise.lock() = Some(tx);
+        } else {
+            return Err(BlewError::NotInitialized);
+        }
+
+        let code: i32 = jvm()
             .attach_current_thread(|env| {
                 let name = env.new_string(&config.local_name)?;
 
@@ -176,16 +207,42 @@ impl PeripheralBackend for AndroidPeripheral {
                 env.call_static_method(
                     peripheral_class(),
                     jni_str!("startAdvertising"),
-                    jni_sig!("(Ljava/lang/String;[Ljava/lang/String;)V"),
+                    jni_sig!("(Ljava/lang/String;[Ljava/lang/String;)I"),
                     &[(&name).into(), (&uuids).into()],
-                )?;
-
-                Ok(())
+                )?
+                .i()
             })
             .map_err(|e| jni_err(&e))?;
 
-        debug!("advertising started");
-        Ok(())
+        if code != ADVERTISE_OK {
+            // Registered above, so it has to come back off before returning.
+            let _ = STATE
+                .lock()
+                .as_ref()
+                .and_then(|s| s.pending_advertise.lock().take());
+            return Err(BlewError::Peripheral {
+                source: "advertiser unavailable (is Bluetooth on?)".into(),
+            });
+        }
+
+        // The synchronous return only says the request reached the stack. The
+        // stack reports whether advertising actually started through
+        // AdvertiseCallback, and it frequently does not -- too many
+        // advertisers, an unsupported payload size, a radio that cannot
+        // advertise. Reporting Ok here regardless is how a peripheral ends up
+        // silently invisible.
+        match tokio::time::timeout(ADVERTISE_TIMEOUT, rx).await {
+            Ok(Ok(result)) => {
+                if result.is_ok() {
+                    debug!("advertising started");
+                }
+                result
+            }
+            Ok(Err(_)) => Err(BlewError::Peripheral {
+                source: "advertising result dropped".into(),
+            }),
+            Err(_) => Err(BlewError::Timeout),
+        }
     }
 
     async fn stop_advertising(&self) -> BlewResult<()> {
