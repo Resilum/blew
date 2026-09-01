@@ -696,25 +696,47 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnL2ca
 // Channel closed (one per Kotlin class)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnL2capChannelClosed(
-    _env: EnvUnowned,
+    mut env: EnvUnowned,
     _class: JClass,
     socket_id: jint,
+    error: JString,
 ) {
     guard("nativeOnL2capChannelClosed", || {
-        trace!(socket_id, "L2CAP channel closed");
-        super::l2cap_state::on_channel_closed(socket_id);
+        // `error` is null for a close either side asked for, and a message
+        // when the channel died on its own.
+        // A null `error` fails to convert and lands as `None`, which is
+        // exactly the "closed deliberately" case.
+        let mut reason = None;
+        env.with_env(|env| {
+            reason = jstring_to_string(env, &error);
+            Ok::<_, jni::errors::Error>(())
+        })
+        .into_outcome();
+        trace!(socket_id, ?reason, "L2CAP channel closed");
+        super::l2cap_state::on_channel_closed(socket_id, reason);
     });
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnL2capChannelClosed(
-    _env: EnvUnowned,
+    mut env: EnvUnowned,
     _class: JClass,
     socket_id: jint,
+    error: JString,
 ) {
     guard("nativeOnL2capChannelClosed", || {
-        trace!(socket_id, "L2CAP channel closed (server)");
-        super::l2cap_state::on_channel_closed(socket_id);
+        // `error` is null for a close either side asked for, and a message
+        // when the channel died on its own.
+        // A null `error` fails to convert and lands as `None`, which is
+        // exactly the "closed deliberately" case.
+        let mut reason = None;
+        env.with_env(|env| {
+            reason = jstring_to_string(env, &error);
+            Ok::<_, jni::errors::Error>(())
+        })
+        .into_outcome();
+        trace!(socket_id, ?reason, "L2CAP channel closed (server)");
+        super::l2cap_state::on_channel_closed(socket_id, reason);
     });
 }
 

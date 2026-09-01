@@ -48,8 +48,8 @@ struct L2capState {
 
 fn queue_capacity(config: &L2capConfig) -> usize {
     config
-        .buffer_size
-        .div_ceil(config.read_chunk_size.max(1))
+        .effective_buffer_size()
+        .div_ceil(config.effective_read_chunk_size())
         .max(MIN_QUEUE_CHUNKS)
 }
 
@@ -77,13 +77,42 @@ pub(crate) fn init_statics() {
     let _ = TOKIO_HANDLE.set(tokio::runtime::Handle::current());
 }
 
+/// Tell Kotlin how large its socket reads should be.
+///
+/// The read loop lives on the Kotlin side, so `read_chunk_size` has to cross
+/// the boundary or the configured value would size only the Rust-side bridge
+/// while the socket kept reading its own fixed amount -- which would also make
+/// [`queue_capacity`] describe a bound that isn't the real one.
+fn push_read_buffer_size(config: &L2capConfig, is_server: bool) {
+    let bytes = i32::try_from(config.effective_read_chunk_size()).unwrap_or(i32::MAX);
+    let result = jvm().attach_current_thread(|env| {
+        let class = if is_server {
+            peripheral_class()
+        } else {
+            central_class()
+        };
+        env.call_static_method(
+            class,
+            jni_str!("setL2capReadBufferSize"),
+            jni_sig!("(I)V"),
+            &[bytes.into()],
+        )?;
+        Ok::<_, jni::errors::Error>(())
+    });
+    if let Err(e) = result {
+        tracing::warn!("failed to set L2CAP read buffer size: {e}");
+    }
+}
+
 pub(crate) fn set_client_config(config: L2capConfig) {
+    push_read_buffer_size(&config, false);
     if let Some(s) = STATE.get() {
         *s.client_config.lock() = config;
     }
 }
 
 pub(crate) fn set_server_config(config: L2capConfig) {
+    push_read_buffer_size(&config, true);
     if let Some(s) = STATE.get() {
         *s.server_config.lock() = config;
     }
@@ -134,9 +163,9 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
             s.client_config.lock().clone()
         }
     });
-    let read_chunk = config.read_chunk_size.max(1);
+    let read_chunk = config.effective_read_chunk_size();
 
-    let (app_half, bridge_half) = tokio::io::duplex(config.buffer_size);
+    let (app_half, bridge_half) = tokio::io::duplex(config.effective_buffer_size());
     let (mut bridge_reader, mut bridge_writer) = tokio::io::split(bridge_half);
 
     let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(queue_capacity(&config));
@@ -260,11 +289,18 @@ pub(crate) fn on_channel_data(socket_id: i32, data: &[u8]) {
     let _ = tx.blocking_send(data.to_vec());
 }
 
-pub(crate) fn on_channel_closed(socket_id: i32) {
+pub(crate) fn on_channel_closed(socket_id: i32, error: Option<String>) {
     if let Some(s) = STATE.get() {
         s.data_tx.lock().remove(&socket_id);
         if let Some(slot) = s.close_reasons.lock().remove(&socket_id) {
-            slot.set(L2capCloseReason::Closed);
+            // Kotlin funnels deliberate closes, read failures, link loss and
+            // write failures through one callback; only the message
+            // distinguishes them. Reporting them all as `Closed` would make
+            // every transport failure look like the peer hanging up politely.
+            slot.set(match error {
+                Some(message) => L2capCloseReason::TransportError(message),
+                None => L2capCloseReason::Closed,
+            });
         }
     }
 }

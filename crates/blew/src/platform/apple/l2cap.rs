@@ -146,8 +146,8 @@ impl StreamDelegate {
 /// Queue depth in chunks for `buffer_size` bytes of `read_chunk_size` chunks.
 fn queue_capacity(config: &L2capConfig) -> usize {
     config
-        .buffer_size
-        .div_ceil(config.read_chunk_size.max(1))
+        .effective_buffer_size()
+        .div_ceil(config.effective_read_chunk_size())
         .max(MIN_QUEUE_CHUNKS)
 }
 
@@ -300,6 +300,13 @@ impl ReactorChannel {
             // peer returning credits produces a HasSpaceAvailable event, which
             // re-marks this channel and brings us back here.
             if !self.output.hasSpaceAvailable() {
+                // "No space" and "dead" are indistinguishable from
+                // hasSpaceAvailable alone, and a dead stream never reports
+                // space again -- so without this check a failed output stream
+                // stalls every subsequent write for the life of the channel.
+                if self.output.streamStatus() == NSStreamStatus::Error {
+                    return Pump::Done(stream_error(self.output.streamError().as_deref()));
+                }
                 break;
             }
             let remaining = &front[self.pending_offset..];
@@ -359,10 +366,20 @@ impl ReactorChannel {
             permit.send(buf);
         }
 
-        if self.input.streamStatus() == NSStreamStatus::Error {
-            return Pump::Done(stream_error(self.input.streamError().as_deref()));
+        // A clean peer close produces no readable bytes, so the loop above
+        // exits without ever seeing the 0-length read that means EOF. Only the
+        // stream's own status reports it, and `AtEnd` is only reached once
+        // everything readable has been consumed -- anything still buffered
+        // keeps the status at Open/Reading, and anything already handed to
+        // `inbound_tx` is still delivered after the sender drops.
+        match self.input.streamStatus() {
+            NSStreamStatus::Error => Pump::Done(stream_error(self.input.streamError().as_deref())),
+            NSStreamStatus::AtEnd => {
+                trace!(id, "apple L2CAP input stream at end");
+                Pump::Done(L2capCloseReason::Closed)
+            }
+            _ => Pump::Continue,
         }
-        Pump::Continue
     }
 }
 
@@ -422,7 +439,8 @@ impl L2capReactor {
                 autoreleasepool(|_| {
                     self.drain_commands(&run_loop);
                     self.pump_channels(&run_loop);
-                    Self::wait_for_work(&run_loop);
+                    let secs = self.sleep_secs(Instant::now());
+                    Self::wait_for_work(&run_loop, secs);
                 });
             }
         });
@@ -536,10 +554,27 @@ impl L2capReactor {
         }
     }
 
-    /// Block until a stream event, a [`wake_reactor`] call, or the idle
-    /// backstop.
-    fn wait_for_work(run_loop: &NSRunLoop) {
-        let deadline = NSDate::dateWithTimeIntervalSinceNow(RUN_LOOP_IDLE_SECS);
+    /// How long the reactor may sleep before it has work of its own.
+    ///
+    /// A lingering channel has to be torn down at its deadline whether or not
+    /// anything signals it, so sleeping past that deadline would overrun a
+    /// short `linger_timeout` by up to the idle backstop.
+    fn sleep_secs(&self, now: Instant) -> f64 {
+        let mut secs = RUN_LOOP_IDLE_SECS;
+        for channel in self.channels.values() {
+            let (Some(since), Some(limit)) = (channel.closing_since, channel.linger_timeout) else {
+                continue;
+            };
+            let remaining = limit.saturating_sub(now.saturating_duration_since(since));
+            secs = secs.min(remaining.as_secs_f64());
+        }
+        secs.max(0.0)
+    }
+
+    /// Block until a stream event, a [`wake_reactor`] call, or the next
+    /// deadline the reactor owes something to.
+    fn wait_for_work(run_loop: &NSRunLoop, secs: f64) {
+        let deadline = NSDate::dateWithTimeIntervalSinceNow(secs);
         run_loop.acceptInputForMode_beforeDate(default_run_loop_mode(), &deadline);
     }
 }
@@ -592,13 +627,13 @@ pub(crate) fn bridge_l2cap_channel(
         output,
         inbound_tx,
         outbound_rx,
-        read_chunk_size: config.read_chunk_size.max(1),
+        read_chunk_size: config.effective_read_chunk_size(),
         close_reason: close_reason.clone(),
         linger_timeout: config.linger_timeout,
     })))
     .expect("apple L2CAP reactor available");
 
-    let (app_side, io_side) = tokio::io::duplex(config.buffer_size);
+    let (app_side, io_side) = tokio::io::duplex(config.effective_buffer_size());
     let (mut io_reader, mut io_writer) = tokio::io::split(io_side);
 
     let inbound_ready = ready_set().clone();
@@ -623,7 +658,7 @@ pub(crate) fn bridge_l2cap_channel(
         trace!(id = channel_id, "apple L2CAP inbound async bridge exited");
     });
 
-    let read_chunk = config.read_chunk_size.max(1);
+    let read_chunk = config.effective_read_chunk_size();
     runtime.spawn(async move {
         trace!(id = channel_id, "apple L2CAP outbound async bridge started");
         let mut buf = vec![0_u8; read_chunk];

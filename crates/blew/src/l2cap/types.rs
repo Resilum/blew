@@ -30,6 +30,16 @@ pub const DEFAULT_L2CAP_READ_CHUNK_SIZE: usize = 4096;
 /// Default for [`L2capConfig::linger_timeout`].
 pub const DEFAULT_L2CAP_LINGER_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Floor applied to [`L2capConfig::buffer_size`].
+///
+/// A zero-capacity buffer is not a tight bound, it is a deadlock:
+/// `tokio::io::duplex(0)` never accepts a write, so neither direction could
+/// make progress.
+pub const MIN_L2CAP_BUFFER_SIZE: usize = 1024;
+/// Floor applied to [`L2capConfig::read_chunk_size`]. A zero-length read
+/// makes no progress either.
+pub const MIN_L2CAP_READ_CHUNK_SIZE: usize = 64;
+
 /// Tuning for a single L2CAP channel.
 ///
 /// Construct with `..Default::default()` so a new field costs you one
@@ -56,8 +66,14 @@ pub struct L2capConfig {
     /// Each direction holds this much twice: once in the stream buffer the
     /// application reads and writes, and once in the queue handing bytes to the
     /// platform socket. Budget roughly `4 * buffer_size` per open channel.
+    ///
+    /// Raised to [`MIN_L2CAP_BUFFER_SIZE`], and to `read_chunk_size`, if set
+    /// lower — a buffer too small to hold one read would stall rather than
+    /// throttle.
     pub buffer_size: usize,
     /// Largest read issued against the platform socket at once.
+    ///
+    /// Raised to [`MIN_L2CAP_READ_CHUNK_SIZE`] if set lower.
     pub read_chunk_size: usize,
     /// How long the backend keeps a closing channel alive to finish writing
     /// whatever is still queued, before tearing it down regardless.
@@ -75,6 +91,23 @@ pub struct L2capConfig {
     /// Note this is delivery to the *platform socket*, not acknowledgement by
     /// the peer. Nothing here waits for the far end to read.
     pub linger_timeout: Option<Duration>,
+}
+
+impl L2capConfig {
+    /// `read_chunk_size` with the floor applied.
+    #[must_use]
+    pub(crate) fn effective_read_chunk_size(&self) -> usize {
+        self.read_chunk_size.max(MIN_L2CAP_READ_CHUNK_SIZE)
+    }
+
+    /// `buffer_size` with the floors applied. Never smaller than one read,
+    /// so a full chunk always has somewhere to land.
+    #[must_use]
+    pub(crate) fn effective_buffer_size(&self) -> usize {
+        self.buffer_size
+            .max(MIN_L2CAP_BUFFER_SIZE)
+            .max(self.effective_read_chunk_size())
+    }
 }
 
 impl Default for L2capConfig {
@@ -118,5 +151,46 @@ impl L2capCloseReason {
                 "L2CAP transport error: {msg}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_returned_unchanged() {
+        let config = L2capConfig::default();
+        assert_eq!(config.effective_buffer_size(), DEFAULT_L2CAP_BUFFER_SIZE);
+        assert_eq!(
+            config.effective_read_chunk_size(),
+            DEFAULT_L2CAP_READ_CHUNK_SIZE
+        );
+    }
+
+    #[test]
+    fn zero_sizes_are_raised_to_the_floor() {
+        // A zero here would deadlock rather than throttle: duplex(0) never
+        // accepts a write and a zero-length read never progresses.
+        let config = L2capConfig {
+            buffer_size: 0,
+            read_chunk_size: 0,
+            ..Default::default()
+        };
+        assert_eq!(config.effective_buffer_size(), MIN_L2CAP_BUFFER_SIZE);
+        assert_eq!(
+            config.effective_read_chunk_size(),
+            MIN_L2CAP_READ_CHUNK_SIZE
+        );
+    }
+
+    #[test]
+    fn buffer_is_never_smaller_than_one_read() {
+        let config = L2capConfig {
+            buffer_size: 2048,
+            read_chunk_size: 16 * 1024,
+            ..Default::default()
+        };
+        assert_eq!(config.effective_buffer_size(), 16 * 1024);
     }
 }

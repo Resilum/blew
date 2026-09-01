@@ -77,7 +77,7 @@ object BleCentralManager {
         L2capSocketManager(
             tag = TAG,
             onData = { socketId, data -> nativeOnL2capChannelData(socketId, data) },
-            onClosed = { socketId -> nativeOnL2capChannelClosed(socketId) },
+            onClosed = { socketId, error -> nativeOnL2capChannelClosed(socketId, error) },
         )
 
     // ── JNI hooks (Kotlin → Rust) ──
@@ -152,7 +152,10 @@ object BleCentralManager {
     )
 
     @JvmStatic
-    external fun nativeOnL2capChannelClosed(socketId: Int)
+    external fun nativeOnL2capChannelClosed(
+        socketId: Int,
+        error: String?,
+    )
 
     @JvmStatic
     external fun nativeOnL2capChannelError(
@@ -786,6 +789,12 @@ object BleCentralManager {
 
     @JvmStatic
     fun closeL2cap(socketId: Int) = l2cap.close(socketId)
+
+    /** Set from `L2capConfig::read_chunk_size` so socket reads match the configured size. */
+    @JvmStatic
+    fun setL2capReadBufferSize(bytes: Int) {
+        l2cap.readBufferSize = bytes
+    }
 
     // ── Helpers ──
 

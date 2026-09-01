@@ -82,7 +82,7 @@ object BlePeripheralManager {
         L2capSocketManager(
             tag = TAG,
             onData = { socketId, data -> nativeOnL2capChannelData(socketId, data) },
-            onClosed = { socketId -> nativeOnL2capChannelClosed(socketId) },
+            onClosed = { socketId, error -> nativeOnL2capChannelClosed(socketId, error) },
             startId = 100_000,
         )
 
@@ -150,7 +150,10 @@ object BlePeripheralManager {
     )
 
     @JvmStatic
-    external fun nativeOnL2capChannelClosed(socketId: Int)
+    external fun nativeOnL2capChannelClosed(
+        socketId: Int,
+        error: String?,
+    )
 
     private val adapterStateReceiver =
         object : BroadcastReceiver() {
@@ -611,4 +614,10 @@ object BlePeripheralManager {
 
     @JvmStatic
     fun closeL2cap(socketId: Int) = l2cap.close(socketId)
+
+    /** Set from `L2capConfig::read_chunk_size` so socket reads match the configured size. */
+    @JvmStatic
+    fun setL2capReadBufferSize(bytes: Int) {
+        l2cap.readBufferSize = bytes
+    }
 }

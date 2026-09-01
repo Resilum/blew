@@ -19,9 +19,13 @@ All notable changes to `blew` are documented here. Format follows
   crash at call time, on a device. Verified by mutation: both a changed
   parameter type and a dropped parameter fail the test.
 
-- **`L2capConfig`**, on `CentralConfig::l2cap` and `PeripheralConfig::l2cap`:
-  `buffer_size`, `read_chunk_size` and `linger_timeout`. Linux observes none of
-  them — `bluer::l2cap::Stream` is already an async byte stream handed straight
+- **Breaking: `L2capConfig`**, on `CentralConfig::l2cap` and
+  `PeripheralConfig::l2cap`: `buffer_size`, `read_chunk_size` and
+  `linger_timeout`. Neither config struct is `#[non_exhaustive]`, so an
+  external struct literal that names every field no longer compiles; see the
+  upgrade guide below. Values below the documented floors are raised rather
+  than honoured — a zero-size buffer would deadlock rather than throttle.
+  Linux observes none of them — `bluer::l2cap::Stream` is already an async byte stream handed straight
   to the caller, so there is no in-process bridge to size and nothing queued
   locally to flush. Apple and Android observe all three.
 - **`L2capChannel::close_reason()` and `L2capCloseReason`.** A dropped ACL link
@@ -99,6 +103,42 @@ All notable changes to `blew` are documented here. Format follows
   new `clippy::unused_async_trait_impl` error that broke the CI lint gate.
 
 ### Fixed
+
+- **Apple: a peer closing an L2CAP channel cleanly is now observed.** The read
+  loop only reported EOF via a zero-length read, which a clean close never
+  produces — it leaves no readable bytes, so the loop never ran. The channel
+  stayed registered and application reads hung indefinitely, with the idle
+  backstop re-observing the same state forever. `NSStreamStatus::AtEnd` is now
+  treated as end-of-stream.
+
+- **Apple: a failed output stream no longer stalls writes permanently.** The
+  write path stopped when `hasSpaceAvailable` was false without checking
+  whether the stream had errored — and an errored stream never reports space
+  again. Once the bounded buffers filled, every subsequent write waited
+  forever. The stream status is now checked before treating "no space" as
+  backpressure.
+
+- **Apple: short `linger_timeout` values are honoured.** The reactor always
+  slept against its one-second idle backstop, so a closing channel with a
+  shorter deadline and a silent peer was torn down up to a second late. The
+  sleep now shortens to the nearest active linger deadline.
+
+- **Android: transport failures are no longer reported as clean closes.** The
+  Kotlin side funnels deliberate closes, read failures, link loss and write
+  failures through one callback, and the Rust side recorded `Closed` for all
+  of them — contradicting the `L2capCloseReason` contract this release
+  introduces. The callback now carries the failure message, and a close the
+  read loop observes *after* the socket was deregistered is correctly reported
+  as deliberate rather than as an error.
+
+- **Android: a peripheral-only application can now use L2CAP.** The shared
+  L2CAP state was initialised only from the central path, so
+  `PeripheralConfig::l2cap` was silently ignored and `l2cap_listener()`
+  panicked on uninitialised state. The peripheral initialises it too.
+
+- **Android: `read_chunk_size` now sizes the actual socket reads.** It sized
+  only the Rust-side bridge while Kotlin read a fixed 4 KiB, which also made
+  the bounded-queue capacity describe a bound that wasn't the real one.
 
 - **Android: L2CAP writes no longer block a Tokio worker.** The outbound task
   called Kotlin's `writeL2cap` — which lands on a blocking `BluetoothSocket`
@@ -500,6 +540,37 @@ bluer's own state machine.
 ---
 
 ## Upgrade guide — 0.3.x → Unreleased
+
+**If you were constructing `CentralConfig` or `PeripheralConfig` as a struct
+literal naming every field**, both gain an `l2cap` field:
+
+```rust
+// Before
+let config = CentralConfig {
+    restore_identifier: None,
+    connect_timeout: Some(Duration::from_secs(15)),
+};
+
+// After — spread the default, which also survives the next field we add
+let config = CentralConfig {
+    connect_timeout: Some(Duration::from_secs(15)),
+    ..Default::default()
+};
+```
+
+Tuning it is optional; the default matches the previous hardcoded behaviour:
+
+```rust
+use blew::{CentralConfig, L2capConfig};
+
+let config = CentralConfig {
+    l2cap: L2capConfig {
+        buffer_size: 128 * 1024,
+        ..Default::default()
+    },
+    ..Default::default()
+};
+```
 
 **If you were matching on `PeripheralRequest::Write`**, it gains an `offset`
 field. Bindings that already end in `..` need no change; exhaustive patterns

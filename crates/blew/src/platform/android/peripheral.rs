@@ -69,6 +69,12 @@ impl PeripheralBackend for AndroidPeripheral {
             request_rx: Mutex::new(Some(request_rx)),
             state_tx,
         });
+        // The L2CAP statics are shared between the two roles but were only
+        // initialised from the central path. A peripheral-only app would find
+        // `set_server_config` silently doing nothing and `l2cap_listener`
+        // panicking on the uninitialised state. Idempotent, so a process that
+        // builds both roles is unaffected.
+        super::l2cap_state::init_statics();
         debug!("AndroidPeripheral initialized");
         Ok(AndroidPeripheral)
     }
