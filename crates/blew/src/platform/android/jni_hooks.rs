@@ -723,6 +723,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnL2capCh
 pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnAdvertisingResult(
     _env: EnvUnowned,
     _class: JClass,
+    request_id: jint,
     success: jboolean,
     error_code: jint,
 ) {
@@ -734,8 +735,8 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnAdve
                 source: format!("advertising failed (AdvertiseCallback error {error_code})").into(),
             })
         };
-        trace!(success, error_code, "advertising result");
-        super::peripheral::complete_advertise(result);
+        trace!(request_id, success, error_code, "advertising result");
+        super::peripheral::complete_advertise(request_id, result);
     });
 }
 

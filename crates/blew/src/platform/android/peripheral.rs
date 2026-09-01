@@ -3,7 +3,7 @@ use jni::{jni_sig, jni_str};
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::error::{BlewError, BlewResult};
@@ -27,22 +27,114 @@ const ADVERTISE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 /// Kotlin's `BlePeripheralManager.ADVERTISE_OK`.
 const ADVERTISE_OK: i32 = 0;
 
+/// Advertising bookkeeping.
+///
+/// Requests carry an id because `AdvertiseCallback` is asynchronous and cannot
+/// be un-registered: a request we gave up on can still deliver its result
+/// afterwards, and without an id that late result would complete whatever
+/// request happened to be waiting by then.
+#[derive(Default)]
+struct AdvertiseState {
+    next_id: i32,
+    /// The one request currently awaiting a callback, if any.
+    pending: Option<(i32, oneshot::Sender<BlewResult<()>>)>,
+    /// Set once the stack confirms advertising started, cleared by `stop`.
+    active: bool,
+}
+
 struct PeripheralState {
     request_tx: mpsc::UnboundedSender<PeripheralRequest>,
     request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
     state_tx: broadcast::Sender<PeripheralStateEvent>,
-    /// Waiter for the asynchronous outcome of `startAdvertising`.
-    pending_advertise: Mutex<Option<oneshot::Sender<BlewResult<()>>>>,
+    advertise: Mutex<AdvertiseState>,
+}
+
+/// Claim the advertising slot, returning the request id and its waiter.
+///
+/// Android can only stop an advertisement by handing back the exact
+/// `AdvertiseCallback` instance it was started with, so a second concurrent
+/// start would strand the first one running with no way to stop it. Every
+/// other backend already rejects this with `AlreadyAdvertising`.
+fn register_advertise() -> BlewResult<(i32, oneshot::Receiver<BlewResult<()>>)> {
+    let guard = STATE.lock();
+    let Some(s) = guard.as_ref() else {
+        return Err(BlewError::NotInitialized);
+    };
+    let mut adv = s.advertise.lock();
+    if adv.active || adv.pending.is_some() {
+        return Err(BlewError::AlreadyAdvertising);
+    }
+    adv.next_id = adv.next_id.wrapping_add(1);
+    let id = adv.next_id;
+    let (tx, rx) = oneshot::channel();
+    adv.pending = Some((id, tx));
+    Ok((id, rx))
+}
+
+/// Drop the waiter for `request_id`, if it is still the current one.
+fn clear_advertise(request_id: i32) {
+    let guard = STATE.lock();
+    if let Some(s) = guard.as_ref() {
+        let mut adv = s.advertise.lock();
+        if adv
+            .pending
+            .as_ref()
+            .is_some_and(|(id, _)| *id == request_id)
+        {
+            adv.pending = None;
+        }
+    }
+}
+
+fn set_advertise_active(active: bool) {
+    let guard = STATE.lock();
+    if let Some(s) = guard.as_ref() {
+        s.advertise.lock().active = active;
+    }
+}
+
+/// Ask Kotlin to tear down `request_id` if it is still the live one. Best
+/// effort: this runs on failure paths where the JNI call may itself be why we
+/// are here.
+fn cancel_advertise(request_id: i32) {
+    let result = jvm().attach_current_thread(|env| {
+        env.call_static_method(
+            peripheral_class(),
+            jni_str!("cancelAdvertising"),
+            jni_sig!("(I)V"),
+            &[request_id.into()],
+        )?;
+        Ok::<_, jni::errors::Error>(())
+    });
+    if let Err(e) = result {
+        warn!("failed to cancel advertising request {request_id}: {e}");
+    }
 }
 
 static STATE: Mutex<Option<PeripheralState>> = Mutex::new(None);
 
 /// Deliver the stack's advertising outcome to a waiting `start_advertising`.
-pub(crate) fn complete_advertise(result: BlewResult<()>) {
-    let tx = STATE
-        .lock()
-        .as_ref()
-        .and_then(|s| s.pending_advertise.lock().take());
+///
+/// A result for a request we already abandoned is dropped rather than applied
+/// to whoever is waiting now.
+pub(crate) fn complete_advertise(request_id: i32, result: BlewResult<()>) {
+    let tx = {
+        let guard = STATE.lock();
+        let Some(s) = guard.as_ref() else { return };
+        let mut adv = s.advertise.lock();
+        match adv.pending.take() {
+            Some((id, tx)) if id == request_id => Some(tx),
+            // Not ours: put back whoever is actually waiting.
+            other => {
+                adv.pending = other;
+                tracing::debug!(
+                    request_id,
+                    "ignoring advertising result for a stale request"
+                );
+                None
+            }
+        }
+    };
     if let Some(tx) = tx {
         let _ = tx.send(result);
     }
@@ -67,6 +159,66 @@ impl AndroidPeripheral {
         let this = <Self as PeripheralBackend>::new().await?;
         super::l2cap_state::set_server_config(config.l2cap.clone());
         Ok(this)
+    }
+}
+
+/// Issue one advertising request and wait for the stack's verdict.
+async fn drive_advertising(
+    config: &AdvertisingConfig,
+    request_id: i32,
+    rx: oneshot::Receiver<BlewResult<()>>,
+) -> BlewResult<()> {
+    let uuid_count = i32::try_from(config.service_uuids.len())
+        .map_err(|_| BlewError::Internal("too many service UUIDs in AdvertisingConfig".into()))?;
+
+    let code: i32 = jvm()
+        .attach_current_thread(|env| {
+            let name = env.new_string(&config.local_name)?;
+
+            let string_class = env.find_class(jni_str!("java/lang/String"))?;
+            let uuids: JObjectArray =
+                env.new_object_array(uuid_count, &string_class, JObject::null())?;
+            for (i, uuid) in config.service_uuids.iter().enumerate() {
+                let s = env.new_string(uuid.to_string())?;
+                uuids.set_element(env, i, &s)?;
+            }
+
+            env.call_static_method(
+                peripheral_class(),
+                jni_str!("startAdvertising"),
+                jni_sig!("(Ljava/lang/String;[Ljava/lang/String;I)I"),
+                &[(&name).into(), (&uuids).into(), request_id.into()],
+            )?
+            .i()
+        })
+        .map_err(|e| jni_err(&e))?;
+
+    if code != ADVERTISE_OK {
+        return Err(BlewError::Peripheral {
+            source: "advertiser unavailable (is Bluetooth on?)".into(),
+        });
+    }
+
+    // The synchronous return only says the request reached the stack. Whether
+    // advertising actually started is decided asynchronously, and frequently
+    // is not -- too many advertisers, an unsupported payload size, a radio
+    // that cannot advertise. Reporting Ok without waiting is how a peripheral
+    // ends up silently invisible.
+    match tokio::time::timeout(ADVERTISE_TIMEOUT, rx).await {
+        Ok(Ok(result)) => {
+            if result.is_ok() {
+                debug!("advertising started");
+            }
+            result
+        }
+        Ok(Err(_)) => Err(BlewError::Peripheral {
+            source: "advertising result dropped".into(),
+        }),
+        // Deliberately not BlewError::Timeout, which is reserved for
+        // adapter-readiness waits.
+        Err(_) => Err(BlewError::Peripheral {
+            source: format!("advertising did not start within {ADVERTISE_TIMEOUT:?}").into(),
+        }),
     }
 }
 
@@ -96,7 +248,7 @@ impl PeripheralBackend for AndroidPeripheral {
             request_tx,
             request_rx: Mutex::new(Some(request_rx)),
             state_tx,
-            pending_advertise: Mutex::new(None),
+            advertise: Mutex::new(AdvertiseState::default()),
         });
         // The L2CAP statics are shared between the two roles but were only
         // initialised from the central path. A peripheral-only app would find
@@ -180,72 +332,25 @@ impl PeripheralBackend for AndroidPeripheral {
     }
 
     async fn start_advertising(&self, config: &AdvertisingConfig) -> BlewResult<()> {
-        let uuid_count = i32::try_from(config.service_uuids.len()).map_err(|_| {
-            BlewError::Internal("too many service UUIDs in AdvertisingConfig".into())
-        })?;
-        let (tx, rx) = oneshot::channel();
-        // Registered before the call: AdvertiseCallback can fire before the
-        // JNI call has even returned.
-        if let Some(s) = STATE.lock().as_ref() {
-            *s.pending_advertise.lock() = Some(tx);
-        } else {
-            return Err(BlewError::NotInitialized);
-        }
-
-        let code: i32 = jvm()
-            .attach_current_thread(|env| {
-                let name = env.new_string(&config.local_name)?;
-
-                let string_class = env.find_class(jni_str!("java/lang/String"))?;
-                let uuids: JObjectArray =
-                    env.new_object_array(uuid_count, &string_class, JObject::null())?;
-                for (i, uuid) in config.service_uuids.iter().enumerate() {
-                    let s = env.new_string(uuid.to_string())?;
-                    uuids.set_element(env, i, &s)?;
-                }
-
-                env.call_static_method(
-                    peripheral_class(),
-                    jni_str!("startAdvertising"),
-                    jni_sig!("(Ljava/lang/String;[Ljava/lang/String;)I"),
-                    &[(&name).into(), (&uuids).into()],
-                )?
-                .i()
-            })
-            .map_err(|e| jni_err(&e))?;
-
-        if code != ADVERTISE_OK {
-            // Registered above, so it has to come back off before returning.
-            let _ = STATE
-                .lock()
-                .as_ref()
-                .and_then(|s| s.pending_advertise.lock().take());
-            return Err(BlewError::Peripheral {
-                source: "advertiser unavailable (is Bluetooth on?)".into(),
-            });
-        }
-
-        // The synchronous return only says the request reached the stack. The
-        // stack reports whether advertising actually started through
-        // AdvertiseCallback, and it frequently does not -- too many
-        // advertisers, an unsupported payload size, a radio that cannot
-        // advertise. Reporting Ok here regardless is how a peripheral ends up
-        // silently invisible.
-        match tokio::time::timeout(ADVERTISE_TIMEOUT, rx).await {
-            Ok(Ok(result)) => {
-                if result.is_ok() {
-                    debug!("advertising started");
-                }
-                result
+        // Claimed before the JNI call: AdvertiseCallback can fire before the
+        // call has even returned.
+        let (request_id, rx) = register_advertise()?;
+        let result = drive_advertising(config, request_id, rx).await;
+        match &result {
+            Ok(()) => set_advertise_active(true),
+            Err(_) => {
+                // Whatever went wrong, this request must not be left owning the
+                // slot, and the stack must not be left advertising behind a
+                // callback nothing can reach.
+                clear_advertise(request_id);
+                cancel_advertise(request_id);
             }
-            Ok(Err(_)) => Err(BlewError::Peripheral {
-                source: "advertising result dropped".into(),
-            }),
-            Err(_) => Err(BlewError::Timeout),
         }
+        result
     }
 
     async fn stop_advertising(&self) -> BlewResult<()> {
+        set_advertise_active(false);
         jvm()
             .attach_current_thread(|env| {
                 env.call_static_method(

@@ -116,6 +116,22 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Fixed
 
+- **Android: `start_advertising` now rejects an overlapping call with
+  `AlreadyAdvertising`,** which is what the `PeripheralBackend` contract has
+  always documented and what Apple, Linux and the mock backend already did.
+  Android was the only backend that accepted a second concurrent start — and
+  because the platform can only stop an advertisement by handing back the
+  exact `AdvertiseCallback` it was started with, the first advertisement was
+  left running with nothing able to reach it.
+
+- **Android: an abandoned advertising request can no longer complete a later
+  one.** Requests carry an id, so a callback arriving after a timeout is
+  dropped rather than applied to whoever is waiting by then, and the failure
+  paths — timeout, JNI error, refusal — release the slot and tear down the
+  stack-side request instead of leaving it running. An advertising timeout
+  also reports `BlewError::Peripheral` rather than `BlewError::Timeout`, which
+  stays reserved for adapter-readiness waits.
+
 - **Android: the advertiser is resolved per call instead of cached at init.**
   `getBluetoothLeAdvertiser` returns null while Bluetooth is off, and nothing
   refreshed the cached null when it came back on — so a peripheral initialised

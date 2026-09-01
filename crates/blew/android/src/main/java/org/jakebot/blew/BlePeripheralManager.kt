@@ -38,6 +38,9 @@ object BlePeripheralManager {
     /** No advertiser — Bluetooth is off, or the radio cannot advertise. */
     const val ADVERTISE_UNAVAILABLE = 1
 
+    /** An advertisement is already running or starting. */
+    const val ADVERTISE_ALREADY = 2
+
     private var context: Context? = null
     private var bluetoothManager: BluetoothManager? = null
 
@@ -158,6 +161,7 @@ object BlePeripheralManager {
     /** Async outcome of [startAdvertising], from the stack's AdvertiseCallback. */
     @JvmStatic
     external fun nativeOnAdvertisingResult(
+        requestId: Int,
         success: Boolean,
         errorCode: Int,
     )
@@ -409,6 +413,10 @@ object BlePeripheralManager {
 
     private var advertiseCallback: AdvertiseCallback? = null
 
+    /** Request id of the live [advertiseCallback], for [cancelAdvertising]. */
+    @Volatile
+    private var advertiseRequestId: Int = 0
+
     /**
      * Begin advertising. Returns [ADVERTISE_OK] when the request was handed to
      * the stack, or a failure code for something that went wrong before that.
@@ -420,7 +428,16 @@ object BlePeripheralManager {
     fun startAdvertising(
         name: String,
         serviceUuids: Array<String>,
+        requestId: Int,
     ): Int {
+        // Android can only stop an advertisement by handing back the exact
+        // AdvertiseCallback it was started with. Overwriting the stored one
+        // would leave the previous advertisement running with nothing able to
+        // reach it, so a second start is refused rather than accepted.
+        if (advertiseCallback != null) {
+            Log.w(TAG, "startAdvertising called while already advertising")
+            return ADVERTISE_ALREADY
+        }
         // Resolved per call: null while Bluetooth is off, and valid again once
         // it comes back on.
         val adv =
@@ -430,6 +447,7 @@ object BlePeripheralManager {
             }
         // Remembered so stopAdvertising passes the same instance back.
         advertiser = adv
+        advertiseRequestId = requestId
 
         bluetoothManager?.adapter?.name = name
 
@@ -461,12 +479,17 @@ object BlePeripheralManager {
             object : AdvertiseCallback() {
                 override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
                     Log.d(TAG, "advertising started")
-                    nativeOnAdvertisingResult(true, 0)
+                    nativeOnAdvertisingResult(requestId, true, 0)
                 }
 
                 override fun onStartFailure(errorCode: Int) {
                     Log.e(TAG, "advertising failed: errorCode=$errorCode")
-                    nativeOnAdvertisingResult(false, errorCode)
+                    // Nothing started, so there is nothing to stop -- release
+                    // the slot or every later start would report ALREADY.
+                    if (advertiseRequestId == requestId) {
+                        advertiseCallback = null
+                    }
+                    nativeOnAdvertisingResult(requestId, false, errorCode)
                 }
             }
 
@@ -481,6 +504,22 @@ object BlePeripheralManager {
             advertiseCallback = null
         }
         Log.d(TAG, "advertising stopped")
+    }
+
+    /**
+     * Tear down [requestId] if it is still the live request, otherwise do
+     * nothing.
+     *
+     * Used when Rust gives up on a start: the callback cannot be
+     * un-registered, so the advertisement has to be stopped explicitly or it
+     * runs on with nothing able to reach it.
+     */
+    @JvmStatic
+    fun cancelAdvertising(requestId: Int) {
+        if (advertiseRequestId == requestId && advertiseCallback != null) {
+            Log.d(TAG, "cancelling advertising request $requestId")
+            stopAdvertising()
+        }
     }
 
     /**
