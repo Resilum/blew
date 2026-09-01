@@ -274,8 +274,21 @@ enum Pump {
 }
 
 impl ReactorChannel {
+    /// The output stream has failed, if it has.
+    fn output_failure(&self) -> Option<L2capCloseReason> {
+        (self.output.streamStatus() == NSStreamStatus::Error)
+            .then(|| stream_error(self.output.streamError().as_deref()))
+    }
+
     /// Move bytes app -> peer, never writing without reported space.
     fn pump_output(&mut self) -> Pump {
+        // Before looking for work, not only when some is found. An error on an
+        // idle output stream consumes its ready mark and would otherwise go
+        // unnoticed until the next application write -- leaving the channel
+        // half-dead with `close_reason()` still empty, possibly forever.
+        if let Some(reason) = self.output_failure() {
+            return Pump::Done(reason);
+        }
         loop {
             if self.pending.is_empty() {
                 match self.outbound_rx.try_recv() {
@@ -304,8 +317,10 @@ impl ReactorChannel {
                 // hasSpaceAvailable alone, and a dead stream never reports
                 // space again -- so without this check a failed output stream
                 // stalls every subsequent write for the life of the channel.
-                if self.output.streamStatus() == NSStreamStatus::Error {
-                    return Pump::Done(stream_error(self.output.streamError().as_deref()));
+                // Re-checked here because a write earlier in this same pass
+                // may have killed the stream.
+                if let Some(reason) = self.output_failure() {
+                    return Pump::Done(reason);
                 }
                 break;
             }

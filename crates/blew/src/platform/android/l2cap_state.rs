@@ -291,17 +291,21 @@ pub(crate) fn on_channel_data(socket_id: i32, data: &[u8]) {
 
 pub(crate) fn on_channel_closed(socket_id: i32, error: Option<String>) {
     if let Some(s) = STATE.get() {
-        s.data_tx.lock().remove(&socket_id);
+        // Record the reason *before* dropping the sender. Dropping it ends the
+        // inbound task, which drops its half of the duplex, which is what the
+        // application sees as EOF -- and `poll_read` consults the slot at that
+        // moment. Setting it afterwards races that wake-up and can report a
+        // transport failure as a clean end-of-stream.
+        //
+        // Kotlin funnels deliberate closes, read failures, link loss and write
+        // failures through one callback; only the message distinguishes them.
         if let Some(slot) = s.close_reasons.lock().remove(&socket_id) {
-            // Kotlin funnels deliberate closes, read failures, link loss and
-            // write failures through one callback; only the message
-            // distinguishes them. Reporting them all as `Closed` would make
-            // every transport failure look like the peer hanging up politely.
             slot.set(match error {
                 Some(message) => L2capCloseReason::TransportError(message),
                 None => L2capCloseReason::Closed,
             });
         }
+        s.data_tx.lock().remove(&socket_id);
     }
 }
 

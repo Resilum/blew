@@ -76,8 +76,6 @@ All notable changes to `blew` are documented here. Format follows
   derive would give — secondary services exist only to be included by
   another service and are vanishingly rare.
 
-### Changed
-
 - **Breaking: `BleDevice` is now `#[non_exhaustive]`.** It is produced by the
   library and never constructed by callers, so this costs nothing today and
   means future advertisement fields stop being breaking changes. Exhaustive
