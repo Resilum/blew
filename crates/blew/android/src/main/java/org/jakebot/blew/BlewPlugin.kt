@@ -10,6 +10,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Plugin
+import java.lang.ref.WeakReference
 
 @TauriPlugin
 class BlewPlugin(
@@ -19,8 +20,12 @@ class BlewPlugin(
         private const val TAG = "BlewPlugin"
         private const val PERMISSION_REQUEST_CODE = 42_001
 
+        // Weak: a static strong reference to an Activity keeps the whole
+        // destroyed instance alive across recreation. Nothing here needs it to
+        // survive its own Activity -- if it has gone, there is no UI thread to
+        // put a permission dialog on anyway.
         @Volatile
-        private var hostActivity: Activity? = null
+        private var hostActivity: WeakReference<Activity>? = null
 
         // Snapshot of the aggregate BLE-permission state as of the last check.
         // `null` means no snapshot recorded yet (initial state).
@@ -30,8 +35,8 @@ class BlewPlugin(
         @JvmStatic
         fun requestBlePermissions() {
             val activity =
-                hostActivity ?: run {
-                    Log.w(TAG, "requestBlePermissions called before plugin load")
+                hostActivity?.get() ?: run {
+                    Log.w(TAG, "requestBlePermissions called with no live host activity")
                     return
                 }
             activity.runOnUiThread { requestOnActivity(activity) }
@@ -88,7 +93,7 @@ class BlewPlugin(
     override fun load(webView: WebView) {
         super.load(webView)
 
-        hostActivity = activity
+        hostActivity = WeakReference(activity)
         val ctx = activity.applicationContext
         BleCentralManager.init(ctx)
         BlePeripheralManager.init(ctx)

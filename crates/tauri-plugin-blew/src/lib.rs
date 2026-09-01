@@ -11,6 +11,12 @@ use tokio::sync::broadcast;
 #[cfg(target_os = "android")]
 const PLUGIN_IDENTIFIER: &str = "org.jakebot.blew";
 
+/// How long plugin setup waits for the Android main thread to run the closure
+/// that hands back the JVM and activity. Generous: this runs once at startup,
+/// and the only thing a shorter deadline buys is a faster failure.
+#[cfg(target_os = "android")]
+const DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[cfg(target_os = "android")]
 static AUTO_REQUEST_PERMISSIONS: AtomicBool = AtomicBool::new(true);
 
@@ -90,9 +96,11 @@ pub fn request_ble_permissions() {
 /// (e.g. the user flipping a switch in system Settings while the app is
 /// backgrounded).
 ///
-/// On non-Android platforms this returns an empty stream — the pattern is
-/// iOS-specific on Apple (use the existing Central/Peripheral state streams,
-/// which surface `CBManager` authorization changes via `centralManagerDidUpdateState:`).
+/// **Android only** — this function does not exist on other targets, so
+/// cross-platform callers must `#[cfg]`-gate the call. There is no runtime
+/// BLE permission to observe elsewhere: on Apple, authorization changes arrive
+/// through the existing Central/Peripheral state streams via
+/// `centralManagerDidUpdateState:`, and Linux has no equivalent at all.
 #[cfg(target_os = "android")]
 pub fn permission_events() -> blew::util::BroadcastEventStream<BlePermissionStatus> {
     let tx = PERMISSIONS_TX.get_or_init(|| broadcast::channel(16).0);
@@ -165,9 +173,20 @@ fn install_android_context() -> Result<*mut std::ffi::c_void, Box<dyn std::error
         })();
         let _ = tx.send(result);
     });
+    // Bounded on purpose. `dispatch` hands the closure to the Android main
+    // thread, so this blocks until that thread runs it -- and if it never does
+    // (it is already blocked, or wry changes how dispatch is scheduled) an
+    // unbounded wait here is a silent hang at startup with no log and no
+    // error, on a device, which is close to undiagnosable. A timeout turns
+    // that into a plugin-setup failure that says what happened.
     let (vm, activity_global) = rx
-        .recv()
-        .map_err(|e| format!("wry JNI dispatch never returned: {e}"))?
+        .recv_timeout(DISPATCH_TIMEOUT)
+        .map_err(|e| {
+            format!(
+                "wry JNI dispatch did not run within {DISPATCH_TIMEOUT:?}: {e} \
+                 (is the Android main thread blocked?)"
+            )
+        })?
         .map_err(|e| format!("JNI error capturing JVM/activity: {e}"))?;
 
     let vm_ptr = vm.get_java_vm_pointer() as *mut c_void;
