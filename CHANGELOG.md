@@ -5,6 +5,16 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Android: `BleCentralManager.init` / `BlePeripheralManager.init` crashed on
+  startup with `MethodNotFound`.** Both `init(Context)` methods were missing
+  `@JvmStatic`, so on a Kotlin `object` they only compiled as instance methods
+  reachable through the synthesized `INSTANCE` field. `init_jvm()` calls them
+  with `call_static_method`, which found no matching static method and
+  panicked, aborting the process. Every other Rust-called method in these
+  files already carried `@JvmStatic`; `init` was the one omission.
+
 ## [0.4.0-beta.1] — 2026-09-01
 
 ### Added

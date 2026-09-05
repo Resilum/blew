@@ -191,6 +191,7 @@ object BlePeripheralManager {
     @Volatile
     private var receiverRegistered = false
 
+    @JvmStatic
     fun init(ctx: Context) {
         context = ctx
         bluetoothManager = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
