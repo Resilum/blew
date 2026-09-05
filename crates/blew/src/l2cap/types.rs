@@ -93,6 +93,12 @@ pub struct L2capConfig {
     pub linger_timeout: Option<Duration>,
 }
 
+// Only the bridged backends size a buffer; Linux hands `bluer::l2cap::Stream`
+// straight to the caller and has nothing to apply these to.
+#[cfg_attr(
+    not(any(target_vendor = "apple", target_os = "android")),
+    allow(dead_code)
+)]
 impl L2capConfig {
     /// `read_chunk_size` with the floor applied.
     #[must_use]

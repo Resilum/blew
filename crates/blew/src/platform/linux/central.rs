@@ -87,6 +87,37 @@ async fn connect_inner(handle: Arc<CentralInner>, device_id: DeviceId) -> BlewRe
     Ok(())
 }
 
+/// Drop BlueZ's cached records for devices this scan has no business keeping.
+///
+/// BlueZ replays its device cache as `DeviceAdded` events at the start of every
+/// discovery session, using stale names and UUIDs from previous sessions.
+/// Dropping the cached record makes BlueZ treat the device as new and emit
+/// fresh advertisement data.
+///
+/// `remove_device` deletes the record outright, taking its bonding keys and
+/// trust flag with it — and the cache is shared with every other application on
+/// the host. Never evict a device that is connected, paired, or trusted: those
+/// belong to the user, not to this scan. Any property that cannot be read
+/// counts as a reason to keep the device.
+async fn evict_stale_cache_entries(adapter: &Adapter) {
+    let Ok(addrs) = adapter.device_addresses().await else {
+        return;
+    };
+    for addr in addrs {
+        let Ok(dev) = adapter.device(addr) else {
+            continue;
+        };
+        let keep = dev.is_connected().await.unwrap_or(true)
+            || dev.is_paired().await.unwrap_or(true)
+            || dev.is_trusted().await.unwrap_or(true);
+        if keep {
+            trace!(device_id = %addr, "keeping cached device out of scan-start eviction");
+            continue;
+        }
+        adapter.remove_device(addr).await.ok();
+    }
+}
+
 /// Watch a connected device's `Connected` property and report link loss.
 ///
 /// bluer surfaces this over D-Bus independently of any discovery session, so
@@ -337,31 +368,7 @@ impl CentralBackend for LinuxCentral {
         let handle = Arc::clone(&self.0);
         async move {
             debug!(service_filter = ?filter.services, "starting BLE scan");
-            // BlueZ replays its device cache as DeviceAdded events at the start of
-            // every discovery session, using stale names/UUIDs from previous sessions.
-            // Dropping cached devices makes BlueZ treat them as new and emit fresh
-            // advertisement data.
-            //
-            // `remove_device` deletes the BlueZ record outright, taking its bonding
-            // keys and trust flag with it — and the cache is shared with every other
-            // application on the host. Never evict a device that is connected,
-            // paired, or trusted: those belong to the user, not to this scan. Any
-            // property we cannot read is treated as a reason to keep the device.
-            if let Ok(addrs) = handle.adapter.device_addresses().await {
-                for addr in addrs {
-                    let Ok(dev) = handle.adapter.device(addr) else {
-                        continue;
-                    };
-                    let keep = dev.is_connected().await.unwrap_or(true)
-                        || dev.is_paired().await.unwrap_or(true)
-                        || dev.is_trusted().await.unwrap_or(true);
-                    if keep {
-                        trace!(device_id = %addr, "keeping cached device out of scan-start eviction");
-                        continue;
-                    }
-                    handle.adapter.remove_device(addr).await.ok();
-                }
-            }
+            evict_stale_cache_entries(&handle.adapter).await;
 
             if !filter.services.is_empty() {
                 let df = bluer::DiscoveryFilter {
@@ -708,13 +715,17 @@ impl CentralBackend for LinuxCentral {
         }
     }
 
-    async fn mtu(&self, device_id: &DeviceId) -> u16 {
-        self.0
+    fn mtu(&self, device_id: &DeviceId) -> impl Future<Output = u16> + Send {
+        // Read the cache eagerly: the guard must not be held across the
+        // returned future, which would make it `!Send`.
+        let mtu = self
+            .0
             .mtu_cache
             .lock()
             .get(device_id)
             .copied()
-            .unwrap_or(23)
+            .unwrap_or(23);
+        std::future::ready(mtu)
     }
 
     fn open_l2cap_channel(

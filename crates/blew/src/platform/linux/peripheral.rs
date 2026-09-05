@@ -51,6 +51,77 @@ impl LinuxPeripheral {
     pub async fn with_config(_config: PeripheralConfig) -> BlewResult<Self> {
         <Self as PeripheralBackend>::new().await
     }
+
+    #[allow(clippy::type_complexity)]
+    fn bind_l2cap_listener() -> BlewResult<(
+        Psm,
+        impl futures_core::Stream<Item = BlewResult<(DeviceId, L2capChannel)>> + Send + 'static,
+    )> {
+        debug!("starting L2CAP CoC listener");
+        // Use low-level Socket API to explicitly set security to Low,
+        // preventing BlueZ from triggering a pairing request.
+        let socket = bluer::l2cap::Socket::new_stream().map_err(|e| BlewError::L2cap {
+            source: Box::new(e),
+        })?;
+        socket
+            .set_security(bluer::l2cap::Security {
+                level: bluer::l2cap::SecurityLevel::Low,
+                key_size: 0,
+            })
+            .map_err(|e| BlewError::L2cap {
+                source: Box::new(e),
+            })?;
+        // Advertise a large receive MPS so the peer can send bigger PDUs.
+        socket.set_recv_mtu(65535).map_err(|e| BlewError::L2cap {
+            source: Box::new(e),
+        })?;
+        socket
+            .bind(bluer::l2cap::SocketAddr::any_le())
+            .map_err(|e| BlewError::L2cap {
+                source: Box::new(e),
+            })?;
+        let listener = socket.listen(1).map_err(|e| BlewError::L2cap {
+            source: Box::new(e),
+        })?;
+        let local_addr = listener
+            .as_ref()
+            .local_addr()
+            .map_err(|e| BlewError::L2cap {
+                source: Box::new(e),
+            })?;
+        let psm = Psm(local_addr.psm);
+        debug!(psm = psm.0, "L2CAP listener ready");
+
+        let (tx, rx) = mpsc::channel::<BlewResult<(DeviceId, L2capChannel)>>(16);
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        debug!(peer = ?addr, "incoming L2CAP connection accepted");
+                        let device_id = DeviceId(addr.addr.to_string());
+                        if tx
+                            .send(Ok((device_id, bridge_l2cap(stream))))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "L2CAP accept error");
+                        let _ = tx
+                            .send(Err(BlewError::L2cap {
+                                source: Box::new(e),
+                            }))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok((psm, ReceiverStream::new(rx)))
+    }
 }
 
 impl backend::private::Sealed for LinuxPeripheral {}
@@ -427,76 +498,18 @@ impl PeripheralBackend for LinuxPeripheral {
         }
     }
 
-    async fn l2cap_listener(
+    fn l2cap_listener(
         &self,
-    ) -> BlewResult<(
-        Psm,
-        impl futures_core::Stream<Item = BlewResult<(DeviceId, L2capChannel)>> + Send + 'static,
-    )> {
-        debug!("starting L2CAP CoC listener");
-        // Use low-level Socket API to explicitly set security to Low,
-        // preventing BlueZ from triggering a pairing request.
-        let socket = bluer::l2cap::Socket::new_stream().map_err(|e| BlewError::L2cap {
-            source: Box::new(e),
-        })?;
-        socket
-            .set_security(bluer::l2cap::Security {
-                level: bluer::l2cap::SecurityLevel::Low,
-                key_size: 0,
-            })
-            .map_err(|e| BlewError::L2cap {
-                source: Box::new(e),
-            })?;
-        // Advertise a large receive MPS so the peer can send bigger PDUs.
-        socket.set_recv_mtu(65535).map_err(|e| BlewError::L2cap {
-            source: Box::new(e),
-        })?;
-        socket
-            .bind(bluer::l2cap::SocketAddr::any_le())
-            .map_err(|e| BlewError::L2cap {
-                source: Box::new(e),
-            })?;
-        let listener = socket.listen(1).map_err(|e| BlewError::L2cap {
-            source: Box::new(e),
-        })?;
-        let local_addr = listener
-            .as_ref()
-            .local_addr()
-            .map_err(|e| BlewError::L2cap {
-                source: Box::new(e),
-            })?;
-        let psm = Psm(local_addr.psm);
-        debug!(psm = psm.0, "L2CAP listener ready");
-
-        let (tx, rx) = mpsc::channel::<BlewResult<(DeviceId, L2capChannel)>>(16);
-        tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, addr)) => {
-                        debug!(peer = ?addr, "incoming L2CAP connection accepted");
-                        let device_id = DeviceId(addr.addr.to_string());
-                        if tx
-                            .send(Ok((device_id, bridge_l2cap(stream))))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "L2CAP accept error");
-                        let _ = tx
-                            .send(Err(BlewError::L2cap {
-                                source: Box::new(e),
-                            }))
-                            .await;
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok((psm, ReceiverStream::new(rx)))
+    ) -> impl std::future::Future<
+        Output = BlewResult<(
+            Psm,
+            impl futures_core::Stream<Item = BlewResult<(DeviceId, L2capChannel)>> + Send + 'static,
+        )>,
+    > + Send {
+        // Nothing here awaits: binding the listener is synchronous and the
+        // accept loop runs in its own task. Kept fallible in a helper so `?`
+        // still reads naturally.
+        std::future::ready(Self::bind_l2cap_listener())
     }
 
     fn state_events(&self) -> Self::StateEvents {
