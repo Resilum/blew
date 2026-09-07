@@ -451,12 +451,19 @@ object BlePeripheralManager {
     fun startAdvertising(
         name: String,
         serviceUuids: Array<String>,
+        serviceDataUuids: Array<String>,
+        serviceDataValues: Array<ByteArray>,
         requestId: Int,
-    ): Int = synchronized(advertiseLock) { startAdvertisingLocked(name, serviceUuids, requestId) }
+    ): Int =
+        synchronized(advertiseLock) {
+            startAdvertisingLocked(name, serviceUuids, serviceDataUuids, serviceDataValues, requestId)
+        }
 
     private fun startAdvertisingLocked(
         name: String,
         serviceUuids: Array<String>,
+        serviceDataUuids: Array<String>,
+        serviceDataValues: Array<ByteArray>,
         requestId: Int,
     ): Int {
         // Android can only stop an advertisement by handing back the exact
@@ -486,21 +493,24 @@ object BlePeripheralManager {
                 .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
                 .build()
 
-        val dataBuilder =
+        val thirtyOneBytesOfAdvertisement =
             AdvertiseData
                 .Builder()
                 .setIncludeDeviceName(false)
         for (uuid in serviceUuids) {
-            dataBuilder.addServiceUuid(ParcelUuid(UUID.fromString(uuid)))
+            thirtyOneBytesOfAdvertisement.addServiceUuid(ParcelUuid(UUID.fromString(uuid)))
         }
-        val data = dataBuilder.build()
 
-        // Scan response can carry the device name.
-        val scanResponse =
+        val thirtyOneMoreInTheScanResponse =
             AdvertiseData
                 .Builder()
                 .setIncludeDeviceName(name.isNotEmpty())
-                .build()
+        for ((i, uuid) in serviceDataUuids.withIndex()) {
+            thirtyOneMoreInTheScanResponse.addServiceData(
+                ParcelUuid(UUID.fromString(uuid)),
+                serviceDataValues[i],
+            )
+        }
 
         advertiseCallback =
             object : AdvertiseCallback() {
@@ -524,7 +534,14 @@ object BlePeripheralManager {
                 }
             }
 
-        takeTheNameThenAdvertise(adv, name, settings, data, scanResponse, advertiseCallback)
+        takeTheNameThenAdvertise(
+            adv,
+            name,
+            settings,
+            thirtyOneBytesOfAdvertisement.build(),
+            thirtyOneMoreInTheScanResponse.build(),
+            advertiseCallback,
+        )
         return ADVERTISE_OK
     }
 

@@ -288,14 +288,22 @@ impl CentralBackend for MockCentral {
         let tx = self.event_tx.clone();
         async move {
             if advertising {
-                let name = adv_config.map(|c| c.local_name).filter(|it| !it.is_empty());
+                let (name, service_data) = adv_config.map_or_else(
+                    || (None, HashMap::new()),
+                    |c| {
+                        (
+                            Some(c.local_name).filter(|it| !it.is_empty()),
+                            c.service_data.into_iter().collect::<HashMap<_, _>>(),
+                        )
+                    },
+                );
                 let _ = tx.send(CentralEvent::DeviceDiscovered(BleDevice {
                     id: DeviceId::from("mock-peripheral"),
                     name,
                     rssi: Some(-50),
                     services,
                     manufacturer_data: HashMap::new(),
-                    service_data: HashMap::new(),
+                    service_data,
                 }));
             }
             Ok(())
@@ -861,6 +869,7 @@ mod tests {
             .start_advertising(&AdvertisingConfig {
                 local_name: "test".into(),
                 service_uuids: vec![svc_uuid],
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1163,6 +1172,7 @@ mod tests {
         let config = AdvertisingConfig {
             local_name: "test".into(),
             service_uuids: vec![],
+            ..Default::default()
         };
 
         peripheral.start_advertising(&config).await.unwrap();
@@ -1180,6 +1190,7 @@ mod tests {
             .start_advertising(&AdvertisingConfig {
                 local_name: String::new(),
                 service_uuids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1194,6 +1205,34 @@ mod tests {
             panic!("the advertisement never reached the central");
         };
         assert_eq!(device.name, None);
+    }
+
+    #[tokio::test]
+    async fn advertised_service_data_reaches_the_scanning_central() {
+        let (c, p) = MockLink::pair();
+        let peripheral = Peripheral::from_backend(p.peripheral);
+        let central = Central::from_backend(c.central);
+        let svc = Uuid::from_u128(0x0000_1234_0000_1000_8000_0080_5f9b_34fb);
+
+        peripheral
+            .start_advertising(&AdvertisingConfig {
+                local_name: "test".into(),
+                service_uuids: vec![svc],
+                service_data: [(svc, vec![7, 8, 9])].into_iter().collect(),
+            })
+            .await
+            .unwrap();
+        let mut events = central.events();
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::AdapterStateChanged { powered: true }
+        ));
+        central.start_scan(ScanFilter::default()).await.unwrap();
+
+        let Some(CentralEvent::DeviceDiscovered(device)) = events.next().await else {
+            panic!("the advertisement never reached the central");
+        };
+        assert_eq!(device.service_data.get(&svc), Some(&vec![7, 8, 9]));
     }
 
     #[tokio::test]
@@ -1555,6 +1594,7 @@ mod tests {
         let config = AdvertisingConfig {
             local_name: "test".into(),
             service_uuids: vec![],
+            ..Default::default()
         };
 
         peripheral.start_advertising(&config).await.unwrap();
